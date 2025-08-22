@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 .logo.vite:hover {
   filter: drop-shadow(0 0 2em #747bff);
 }
@@ -93,6 +97,80 @@ button {
 
 #greet-input {
   margin-right: 5px;
+}
+
+/* Custom styles for search overlay */
+.search-focus-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 9998;
+  transition: all 0.3s ease;
+}
+
+.star-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.star {
+  position: absolute;
+  width: 2px;
+  height: 2px;
+  background: #35c7ff;
+  border-radius: 50%;
+  animation: twinkle 3s infinite;
+}
+
+.typing-star {
+  animation: typing-twinkle 1.5s infinite;
+}
+
+@keyframes twinkle {
+  0%, 100% { opacity: 0.3; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.2); }
+}
+
+@keyframes typing-twinkle {
+  0%, 100% { opacity: 0.6; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.5); }
+}
+
+/* GridStack specific styles */
+.gridstack {
+  background: transparent;
+}
+
+.gridstack .grid-stack-item {
+  background: rgba(55, 65, 81, 0.8);
+  border: 1px solid rgba(75, 85, 99, 0.5);
+  border-radius: 8px;
+  backdrop-filter: blur(8px);
+}
+
+.gridstack .grid-stack-item-content {
+  padding: 16px;
+  border-radius: 7px;
+  background: rgba(31, 41, 55, 0.9);
+}
+
+.gridstack .grid-stack-item:hover {
+  border-color: rgba(59, 130, 246, 0.5);
+}
+
+.gridstack .grid-stack-item.move-enabled {
+  cursor: move;
+}
+
+.gridstack .grid-stack-item.move-disabled {
+  cursor: default;
 }
 
 @media (prefers-color-scheme: dark) {

@@ -14,7 +14,10 @@
   "dependencies": {
     "solid-js": "^1.9.3",
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-opener": "^2",
+    "dyna-solid": "workspace:*",
+    "gridstack": "^12.2.1",
+    "@babel/standalone": "^7.27.6"
   },
   "devDependencies": {
     "typescript": "~5.6.2",
