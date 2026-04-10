@@ -9,10 +9,13 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tauri::State;
+use tokio::io::AsyncReadExt;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const VIBE_AGENT_COMMAND_KEY: &str = "vibe_agent_command";
 const VIBE_AGENT_WORKDIR_KEY: &str = "vibe_agent_workdir";
+const VIBE_AGENT_MODEL_KEY: &str = "vibe_agent_model";
+const VIBE_AGENT_MY_VIBES_KEY: &str = "vibe_agent_my_vibes";
 const VIBE_SPEC_MARKDOWN: &str =
     include_str!("../../../../vibe-protocol-website/public/docs/VIBE.md");
 
@@ -35,11 +38,32 @@ impl VibeState {
 pub struct VibeAgentSettings {
     pub command: String,
     pub workdir: Option<String>,
+    pub my_vibes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpModelOption {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpModelSelector {
+    pub config_id: String,
+    pub current_value: String,
+    pub options: Vec<AcpModelOption>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VibeNavigationRequest {
     pub url: String,
+    pub selected_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VibeAgentModelPreference {
+    pub selected_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +88,14 @@ pub struct AgentLogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpTrafficEntry {
+    pub direction: String,
+    pub event: String,
+    pub summary: String,
+    pub payload: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VibeNavigationResult {
     pub source_url: String,
     pub normalized_url: String,
@@ -75,10 +107,12 @@ pub struct VibeNavigationResult {
     pub html: String,
     pub generated_files: Vec<GeneratedFile>,
     pub logs: Vec<AgentLogEntry>,
+    pub traffic: Vec<AcpTrafficEntry>,
     pub final_message: Option<String>,
     pub stop_reason: String,
     pub fallback_used: bool,
     pub agent_settings: VibeAgentSettings,
+    pub model_selector: Option<AcpModelSelector>,
 }
 
 #[derive(Debug)]
@@ -105,15 +139,18 @@ struct TrackedWrite {
 #[derive(Debug)]
 struct AgentRunResult {
     logs: Vec<AgentLogEntry>,
+    traffic: Vec<AcpTrafficEntry>,
     generated_files: Vec<GeneratedFile>,
     assistant_text: String,
     stop_reason: String,
+    model_selector: Option<AcpModelSelector>,
 }
 
 #[derive(Clone)]
 struct VibeAcpClient {
     allowed_root: PathBuf,
     logs: Arc<Mutex<Vec<AgentLogEntry>>>,
+    traffic: Arc<Mutex<Vec<AcpTrafficEntry>>>,
     writes: Arc<Mutex<Vec<TrackedWrite>>>,
     assistant_text: Arc<Mutex<String>>,
 }
@@ -123,6 +160,7 @@ impl VibeAcpClient {
         Self {
             allowed_root,
             logs: Arc::new(Mutex::new(Vec::new())),
+            traffic: Arc::new(Mutex::new(Vec::new())),
             writes: Arc::new(Mutex::new(Vec::new())),
             assistant_text: Arc::new(Mutex::new(String::new())),
         }
@@ -143,10 +181,34 @@ impl VibeAcpClient {
         }
     }
 
+    fn push_traffic(
+        &self,
+        direction: impl Into<String>,
+        event: impl Into<String>,
+        summary: impl Into<String>,
+        payload: impl Into<String>,
+    ) {
+        if let Ok(mut traffic) = self.traffic.lock() {
+            traffic.push(AcpTrafficEntry {
+                direction: direction.into(),
+                event: event.into(),
+                summary: summary.into(),
+                payload: payload.into(),
+            });
+        }
+    }
+
     fn snapshot_logs(&self) -> Vec<AgentLogEntry> {
         self.logs
             .lock()
             .map(|logs| logs.clone())
+            .unwrap_or_default()
+    }
+
+    fn snapshot_traffic(&self) -> Vec<AcpTrafficEntry> {
+        self.traffic
+            .lock()
+            .map(|traffic| traffic.clone())
             .unwrap_or_default()
     }
 
@@ -171,6 +233,12 @@ impl acp::Client for VibeAcpClient {
         &self,
         args: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
+        self.push_traffic(
+            "agent -> browser",
+            "request_permission.request",
+            format!("Permission request for session {}", args.session_id),
+            debug_payload(&args),
+        );
         self.push_log(
             "permission",
             format!("Agent requested permission for session {}", args.session_id),
@@ -191,6 +259,13 @@ impl acp::Client for VibeAcpClient {
             acp::RequestPermissionOutcome::Cancelled
         };
 
+        self.push_traffic(
+            "browser -> agent",
+            "request_permission.response",
+            "Permission decision returned to agent",
+            debug_payload(&outcome),
+        );
+
         Ok(acp::RequestPermissionResponse::new(outcome))
     }
 
@@ -198,6 +273,12 @@ impl acp::Client for VibeAcpClient {
         &self,
         args: acp::WriteTextFileRequest,
     ) -> acp::Result<acp::WriteTextFileResponse> {
+        self.push_traffic(
+            "agent -> browser",
+            "fs/write_text_file.request",
+            format!("Write request for {}", args.path.display()),
+            debug_payload(&args),
+        );
         let path = normalize_absolute_path(&args.path).map_err(|err| {
             acp::Error::invalid_params().data(serde_json::json!({
                 "path": args.path.display().to_string(),
@@ -235,6 +316,12 @@ impl acp::Client for VibeAcpClient {
             .unwrap_or_else(|_| path.display().to_string());
 
         self.push_log("write", format!("Wrote {}", relative));
+        self.push_traffic(
+            "browser -> agent",
+            "fs/write_text_file.response",
+            format!("Accepted write for {}", relative),
+            "{}",
+        );
 
         Ok(acp::WriteTextFileResponse::default())
     }
@@ -243,6 +330,12 @@ impl acp::Client for VibeAcpClient {
         &self,
         args: acp::ReadTextFileRequest,
     ) -> acp::Result<acp::ReadTextFileResponse> {
+        self.push_traffic(
+            "agent -> browser",
+            "fs/read_text_file.request",
+            format!("Read request for {}", args.path.display()),
+            debug_payload(&args),
+        );
         let path = normalize_absolute_path(&args.path).map_err(|err| {
             acp::Error::invalid_params().data(serde_json::json!({
                 "path": args.path.display().to_string(),
@@ -263,10 +356,23 @@ impl acp::Client for VibeAcpClient {
 
         let sliced = slice_text_content(&content, args.line, args.limit);
         self.push_log("read", format!("Read {}", path.display()));
-        Ok(acp::ReadTextFileResponse::new(sliced))
+        let response = acp::ReadTextFileResponse::new(sliced);
+        self.push_traffic(
+            "browser -> agent",
+            "fs/read_text_file.response",
+            format!("Returned file content for {}", path.display()),
+            debug_payload(&response),
+        );
+        Ok(response)
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+        self.push_traffic(
+            "agent -> browser",
+            "session/update",
+            "Session notification received",
+            debug_payload(&args),
+        );
         match args.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
                 let text = content_block_to_string(&chunk.content);
@@ -302,6 +408,41 @@ pub async fn get_vibe_agent_settings(
         .await
         .map(CommandResponse::success)
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn get_vibe_agent_model_selector(
+    state: State<'_, VibeState>,
+) -> Result<CommandResponse<Option<AcpModelSelector>>, String> {
+    let agent_settings = resolve_agent_settings(&state.config_manager)
+        .await
+        .map_err(|err| err.to_string())?;
+    let preferred_model = resolve_agent_model_preference(&state.config_manager)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    probe_agent_model_selector(&agent_settings, &state.data_dir, preferred_model.as_deref())
+        .await
+        .map(CommandResponse::success)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn set_vibe_agent_model_preference(
+    preference: VibeAgentModelPreference,
+    state: State<'_, VibeState>,
+) -> Result<CommandResponse<VibeAgentModelPreference>, String> {
+    persist_agent_model_preference(&state.config_manager, preference.selected_model.as_deref())
+        .await
+        .map_err(|err| err.to_string())?;
+
+    let selected_model = resolve_agent_model_preference(&state.config_manager)
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(CommandResponse::success(VibeAgentModelPreference {
+        selected_model,
+    }))
 }
 
 #[tauri::command]
@@ -342,6 +483,27 @@ pub async fn set_vibe_agent_settings(
         }
     }
 
+    match settings
+        .my_vibes
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(my_vibes) => {
+            state
+                .config_manager
+                .set_config_value(VIBE_AGENT_MY_VIBES_KEY, my_vibes)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        None => {
+            let _ = state
+                .config_manager
+                .delete_config_value(VIBE_AGENT_MY_VIBES_KEY)
+                .await;
+        }
+    }
+
     resolve_agent_settings(&state.config_manager)
         .await
         .map(CommandResponse::success)
@@ -356,22 +518,46 @@ pub async fn visit_vibe_url(
     let agent_settings = resolve_agent_settings(&state.config_manager)
         .await
         .map_err(|err| err.to_string())?;
+    let preferred_model = resolve_agent_model_preference(&state.config_manager)
+        .await
+        .map_err(|err| err.to_string())?;
+    let selected_model = request
+        .selected_model
+        .as_deref()
+        .or(preferred_model.as_deref());
 
-    match visit_vibe_url_inner(&request.url, &agent_settings, &state.data_dir).await {
-        Ok(result) => Ok(CommandResponse::success(result)),
+    match visit_vibe_url_inner(
+        &request.url,
+        selected_model,
+        &agent_settings,
+        &state.data_dir,
+    )
+    .await
+    {
+        Ok(result) => {
+            if let Some(model) = selected_model {
+                persist_agent_model_preference(&state.config_manager, Some(model))
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+
+            Ok(CommandResponse::success(result))
+        }
         Err(err) => Ok(CommandResponse::error(err.to_string())),
     }
 }
 
 async fn visit_vibe_url_inner(
     url_input: &str,
+    selected_model: Option<&str>,
     agent_settings: &VibeAgentSettings,
     data_dir: &Path,
 ) -> Result<VibeNavigationResult> {
     let discovered = discover_vibe_document(url_input).await?;
     let render_session = prepare_render_session(data_dir, &discovered, agent_settings).await?;
-    let prompt = build_vibe_prompt(&discovered, &render_session);
-    let mut agent_run = run_acp_render_agent(agent_settings, &render_session, &prompt).await?;
+    let prompt = build_vibe_prompt(&discovered, &render_session, agent_settings);
+    let mut agent_run =
+        run_acp_render_agent(agent_settings, &render_session, &prompt, selected_model).await?;
 
     let mut fallback_used = false;
     if !render_session.index_path.exists() {
@@ -425,10 +611,12 @@ async fn visit_vibe_url_inner(
         html,
         generated_files: agent_run.generated_files,
         logs: agent_run.logs,
+        traffic: agent_run.traffic,
         final_message,
         stop_reason: agent_run.stop_reason,
         fallback_used,
         agent_settings: agent_settings.clone(),
+        model_selector: agent_run.model_selector,
     })
 }
 
@@ -451,7 +639,60 @@ async fn resolve_agent_settings(config_manager: &ConfigManager) -> Result<VibeAg
         })
         .or_else(default_agent_workdir);
 
-    Ok(VibeAgentSettings { command, workdir })
+    let my_vibes = config_manager
+        .get_config_value(VIBE_AGENT_MY_VIBES_KEY)
+        .await?
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+
+    Ok(VibeAgentSettings {
+        command,
+        workdir,
+        my_vibes,
+    })
+}
+
+async fn resolve_agent_model_preference(config_manager: &ConfigManager) -> Result<Option<String>> {
+    Ok(config_manager
+        .get_config_value(VIBE_AGENT_MODEL_KEY)
+        .await?
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }))
+}
+
+async fn persist_agent_model_preference(
+    config_manager: &ConfigManager,
+    selected_model: Option<&str>,
+) -> Result<()> {
+    match selected_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(selected_model) => {
+            config_manager
+                .set_config_value(VIBE_AGENT_MODEL_KEY, selected_model)
+                .await?
+        }
+        None => {
+            let _ = config_manager
+                .delete_config_value(VIBE_AGENT_MODEL_KEY)
+                .await?;
+        }
+    }
+
+    Ok(())
 }
 
 fn default_agent_command() -> String {
@@ -595,6 +836,7 @@ async fn prepare_render_session(
             context_dir: context_dir.clone(),
             index_path: root_dir.join("index.html"),
         },
+        agent_settings,
     );
 
     tokio::fs::write(
@@ -629,7 +871,10 @@ async fn prepare_render_session(
 fn build_vibe_prompt(
     discovered: &DiscoveredVibeDocument,
     render_session: &RenderSession,
+    agent_settings: &VibeAgentSettings,
 ) -> String {
+    let user_instructions_section =
+        format_user_instructions_section(agent_settings.my_vibes.as_deref());
     format!(
         r#"# Vibe Browser Rendering Job
 
@@ -662,6 +907,8 @@ Your job is to convert the discovered VIBE.md into a concrete page that this bro
 - User requested URL: `{requested_url}`
 - Discovered VIBE.md URL: `{discovered_url}`
 
+{user_instructions_section}
+
 ## Vibe Protocol Spec
 
 ````md
@@ -684,6 +931,7 @@ Your job is to convert the discovered VIBE.md into a concrete page that this bro
         context_prompt = render_session.context_dir.join("PROMPT.md").display(),
         requested_url = discovered.normalized_url,
         discovered_url = discovered.discovered_url,
+        user_instructions_section = user_instructions_section,
         vibe_spec = VIBE_SPEC_MARKDOWN,
         vibe_markdown = discovered.vibe_markdown,
     )
@@ -693,10 +941,12 @@ async fn run_acp_render_agent(
     agent_settings: &VibeAgentSettings,
     render_session: &RenderSession,
     prompt: &str,
+    selected_model: Option<&str>,
 ) -> Result<AgentRunResult> {
     let agent_settings = agent_settings.clone();
     let render_session = render_session.clone();
     let prompt = prompt.to_string();
+    let selected_model = selected_model.map(str::to_string);
 
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -723,14 +973,262 @@ async fn run_acp_render_agent(
                 .take()
                 .context("agent stdout was not available")?
                 .compat();
+            let stderr_task = child.stderr.take().map(|mut stderr| {
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let _ = stderr.read_to_end(&mut bytes).await;
+                    String::from_utf8_lossy(&bytes).to_string()
+                })
+            });
 
             let client_impl = VibeAcpClient::new(render_session.root_dir.clone());
             let client_snapshot = client_impl.clone();
+            let traffic_snapshot = client_snapshot.clone();
             let session_cwd = render_session.root_dir.display().to_string();
 
             let local_set = tokio::task::LocalSet::new();
-            let stop_reason = local_set
+            let prompt_result = local_set
                 .run_until(async move {
+                    let (conn, handle_io) =
+                        acp::ClientSideConnection::new(client_impl, outgoing, incoming, |future| {
+                            tokio::task::spawn_local(future);
+                        });
+
+                    tokio::task::spawn_local(handle_io);
+
+                    let initialize_request = acp::InitializeRequest::new(acp::ProtocolVersion::V1)
+                        .client_info(
+                            acp::Implementation::new("vibe-browser", env!("CARGO_PKG_VERSION"))
+                                .title("Vibe Browser"),
+                        )
+                        .client_capabilities(
+                            acp::ClientCapabilities::default().fs(
+                                acp::FileSystemCapabilities::default()
+                                    .read_text_file(true)
+                                    .write_text_file(true),
+                            ),
+                        );
+                    traffic_snapshot.push_traffic(
+                        "browser -> agent",
+                        "initialize.request",
+                        "Sent initialize request",
+                        debug_payload(&initialize_request),
+                    );
+                    let initialize_response = conn.initialize(initialize_request).await?;
+                    traffic_snapshot.push_traffic(
+                        "agent -> browser",
+                        "initialize.response",
+                        "Received initialize response",
+                        debug_payload(&initialize_response),
+                    );
+
+                    traffic_snapshot.push_traffic(
+                        "browser -> agent",
+                        "session/new.request",
+                        format!("Requested new ACP session in {}", session_cwd),
+                        session_cwd.clone(),
+                    );
+                    let session = conn
+                        .new_session(acp::NewSessionRequest::new(session_cwd))
+                        .await?;
+                    traffic_snapshot.push_traffic(
+                        "agent -> browser",
+                        "session/new.response",
+                        format!("Started ACP session {}", session.session_id),
+                        debug_payload(&session),
+                    );
+
+                    let mut model_selector =
+                        extract_model_selector(session.config_options.as_deref().unwrap_or(&[]));
+
+                    if let (Some(selected_model), Some(selector)) =
+                        (selected_model.as_deref(), model_selector.as_ref())
+                    {
+                        if selector.current_value != selected_model {
+                            traffic_snapshot.push_traffic(
+                                "browser -> agent",
+                                "session/set_config_option.request",
+                                format!("Selecting model {}", selected_model),
+                                format!(
+                                    "config_id: {}\nvalue: {}",
+                                    selector.config_id, selected_model
+                                ),
+                            );
+                            let response = conn
+                                .set_session_config_option(acp::SetSessionConfigOptionRequest::new(
+                                    session.session_id.clone(),
+                                    selector.config_id.clone(),
+                                    selected_model.to_string(),
+                                ))
+                                .await?;
+
+                            traffic_snapshot.push_traffic(
+                                "agent -> browser",
+                                "session/set_config_option.response",
+                                "Received updated ACP config options",
+                                debug_payload(&response),
+                            );
+                            model_selector = extract_model_selector(&response.config_options);
+                        }
+                    }
+
+                    apply_preferred_model_to_selector(
+                        &mut model_selector,
+                        selected_model.as_deref(),
+                    );
+
+                    traffic_snapshot.push_traffic(
+                        "browser -> agent",
+                        "session/prompt.request",
+                        "Sent Vibe rendering prompt",
+                        truncate_debug_payload(&prompt, 12_000),
+                    );
+                    let response = conn
+                        .prompt(acp::PromptRequest::new(
+                            session.session_id,
+                            vec![prompt.into()],
+                        ))
+                        .await?;
+                    traffic_snapshot.push_traffic(
+                        "agent -> browser",
+                        "session/prompt.response",
+                        format!("Prompt completed with {:?}", response.stop_reason),
+                        debug_payload(&response),
+                    );
+
+                    Ok::<(String, Option<AcpModelSelector>), anyhow::Error>((
+                        format!("{:?}", response.stop_reason),
+                        model_selector,
+                    ))
+                })
+                .await;
+
+            if child.try_wait()?.is_none() {
+                let _ = child.start_kill();
+            }
+            drop(child);
+            let stderr_output = if let Some(task) = stderr_task {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
+                    Ok(Ok(output)) => output,
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+
+            let (stop_reason, model_selector) = match prompt_result {
+                Ok(payload) => payload,
+                Err(err) => {
+                    let stderr_tail = stderr_output
+                        .lines()
+                        .rev()
+                        .take(24)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    if stderr_tail.trim().is_empty() {
+                        return Err(err);
+                    }
+
+                    return Err(anyhow!("{err}\n\nAgent stderr:\n{stderr_tail}"));
+                }
+            };
+
+            let mut generated_files = client_snapshot
+                .snapshot_writes()
+                .into_iter()
+                .map(|write| GeneratedFile {
+                    path: write
+                        .path
+                        .strip_prefix(&render_session.root_dir)
+                        .map(|value| value.display().to_string())
+                        .unwrap_or_else(|_| write.path.display().to_string()),
+                    absolute_path: write.path.display().to_string(),
+                    bytes: write.bytes,
+                })
+                .collect::<Vec<_>>();
+
+            for file in collect_render_output_files(&render_session.root_dir)? {
+                if !generated_files
+                    .iter()
+                    .any(|existing| existing.path == file.path)
+                {
+                    generated_files.push(file);
+                }
+            }
+
+            Ok(AgentRunResult {
+                logs: client_snapshot.snapshot_logs(),
+                traffic: client_snapshot.snapshot_traffic(),
+                generated_files,
+                assistant_text: client_snapshot.snapshot_assistant_text(),
+                stop_reason,
+                model_selector,
+            })
+        })
+    })
+    .await
+    .map_err(|err| anyhow!("ACP render task failed to join: {err}"))?
+}
+
+async fn probe_agent_model_selector(
+    agent_settings: &VibeAgentSettings,
+    data_dir: &Path,
+    preferred_model: Option<&str>,
+) -> Result<Option<AcpModelSelector>> {
+    let agent_settings = agent_settings.clone();
+    let preferred_model = preferred_model.map(str::to_string);
+    let probe_root = data_dir.join("vibe-agent-probe");
+    tokio::fs::create_dir_all(&probe_root).await?;
+    let probe_root = probe_root.join(uuid::Uuid::new_v4().to_string());
+    tokio::fs::create_dir_all(&probe_root).await?;
+
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create ACP probe runtime")?;
+
+        runtime.block_on(async move {
+            let render_session = RenderSession {
+                root_dir: probe_root.clone(),
+                context_dir: probe_root.join("_context"),
+                index_path: probe_root.join("index.html"),
+            };
+            let mut command = build_agent_process(&agent_settings, &render_session)?;
+            let mut child = command.spawn().with_context(|| {
+                format!(
+                    "failed to start ACP agent command: {}",
+                    agent_settings.command
+                )
+            })?;
+
+            let outgoing = child
+                .stdin
+                .take()
+                .context("agent stdin was not available")?
+                .compat_write();
+            let incoming = child
+                .stdout
+                .take()
+                .context("agent stdout was not available")?
+                .compat();
+            let stderr_task = child.stderr.take().map(|mut stderr| {
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let _ = stderr.read_to_end(&mut bytes).await;
+                    String::from_utf8_lossy(&bytes).to_string()
+                })
+            });
+
+            let local_set = tokio::task::LocalSet::new();
+            let probe_root_for_session = probe_root.clone();
+            let probe_result = local_set
+                .run_until(async move {
+                    let client_impl = VibeAcpClient::new(probe_root_for_session.clone());
                     let (conn, handle_io) =
                         acp::ClientSideConnection::new(client_impl, outgoing, incoming, |future| {
                             tokio::task::spawn_local(future);
@@ -755,46 +1253,47 @@ async fn run_acp_render_agent(
                     .await?;
 
                     let session = conn
-                        .new_session(acp::NewSessionRequest::new(session_cwd))
+                        .new_session(acp::NewSessionRequest::new(probe_root_for_session.clone()))
                         .await?;
 
-                    let response = conn
-                        .prompt(acp::PromptRequest::new(
-                            session.session_id,
-                            vec![prompt.into()],
-                        ))
-                        .await?;
+                    let mut selector =
+                        extract_model_selector(session.config_options.as_deref().unwrap_or(&[]));
 
-                    Ok::<String, anyhow::Error>(format!("{:?}", response.stop_reason))
+                    apply_preferred_model_to_selector(&mut selector, preferred_model.as_deref());
+
+                    Ok::<Option<AcpModelSelector>, anyhow::Error>(selector)
                 })
-                .await?;
+                .await;
 
+            if child.try_wait()?.is_none() {
+                let _ = child.start_kill();
+            }
             drop(child);
+            let stderr_output = if let Some(task) = stderr_task {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
+                    Ok(Ok(output)) => output,
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
 
-            let generated_files = client_snapshot
-                .snapshot_writes()
-                .into_iter()
-                .map(|write| GeneratedFile {
-                    path: write
-                        .path
-                        .strip_prefix(&render_session.root_dir)
-                        .map(|value| value.display().to_string())
-                        .unwrap_or_else(|_| write.path.display().to_string()),
-                    absolute_path: write.path.display().to_string(),
-                    bytes: write.bytes,
-                })
-                .collect::<Vec<_>>();
+            tokio::fs::remove_dir_all(&probe_root).await.ok();
 
-            Ok(AgentRunResult {
-                logs: client_snapshot.snapshot_logs(),
-                generated_files,
-                assistant_text: client_snapshot.snapshot_assistant_text(),
-                stop_reason,
-            })
+            match probe_result {
+                Ok(selector) => Ok(selector),
+                Err(err) => {
+                    if stderr_output.trim().is_empty() {
+                        Err(err)
+                    } else {
+                        Err(anyhow!("{err}\n\nAgent stderr:\n{stderr_output}"))
+                    }
+                }
+            }
         })
     })
     .await
-    .map_err(|err| anyhow!("ACP render task failed to join: {err}"))?
+    .map_err(|err| anyhow!("ACP model probe failed to join: {err}"))?
 }
 
 fn build_agent_process(
@@ -806,7 +1305,8 @@ fn build_agent_process(
         command.args(["/C", agent_settings.command.as_str()]);
         command
     } else {
-        let mut command = tokio::process::Command::new("sh");
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let mut command = tokio::process::Command::new(shell);
         command.args(["-lc", agent_settings.command.as_str()]);
         command
     };
@@ -814,8 +1314,10 @@ fn build_agent_process(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    augment_agent_path(&mut command)?;
 
     if let Some(workdir) = agent_settings.workdir.as_deref() {
         command.current_dir(workdir);
@@ -824,6 +1326,28 @@ fn build_agent_process(
     }
 
     Ok(command)
+}
+
+fn augment_agent_path(command: &mut tokio::process::Command) -> Result<()> {
+    let mut paths = Vec::new();
+
+    if let Some(home_dir) = dirs::home_dir() {
+        let opencode_bin = home_dir.join(".opencode/bin");
+        if opencode_bin.exists() {
+            paths.push(opencode_bin);
+        }
+    }
+
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing_path));
+    }
+
+    if !paths.is_empty() {
+        let joined = std::env::join_paths(paths).context("failed to build PATH for ACP agent")?;
+        command.env("PATH", joined);
+    }
+
+    Ok(())
 }
 
 fn content_block_to_string(content: &acp::ContentBlock) -> String {
@@ -835,6 +1359,37 @@ fn content_block_to_string(content: &acp::ContentBlock) -> String {
         acp::ContentBlock::Resource(_) => "<resource>".to_string(),
         _ => "<content>".to_string(),
     }
+}
+
+fn debug_payload(value: &impl std::fmt::Debug) -> String {
+    format!("{value:#?}")
+}
+
+fn truncate_debug_payload(value: &impl std::fmt::Debug, limit: usize) -> String {
+    let payload = debug_payload(value);
+    if payload.chars().count() <= limit {
+        payload
+    } else {
+        let truncated = payload.chars().take(limit).collect::<String>();
+        format!("{truncated}\n…")
+    }
+}
+
+fn format_user_instructions_section(my_vibes: Option<&str>) -> String {
+    let Some(my_vibes) = my_vibes.map(str::trim).filter(|value| !value.is_empty()) else {
+        return String::new();
+    };
+
+    format!(
+        r#"## User Instructions
+
+Treat the User Instructions section below as higher priority than every other instruction in this prompt, the embedded Vibe Protocol spec, and the discovered VIBE.md. If anything conflicts, follow the User Instructions.
+
+````md
+{my_vibes}
+````
+"#
+    )
 }
 
 fn slice_text_content(content: &str, line: Option<u32>, limit: Option<u32>) -> String {
@@ -893,4 +1448,426 @@ fn extract_html_document(assistant_text: &str) -> Option<String> {
     }
 
     None
+}
+
+fn extract_model_selector(config_options: &[acp::SessionConfigOption]) -> Option<AcpModelSelector> {
+    let option = config_options.iter().find(|option| {
+        matches!(
+            option.category,
+            Some(acp::SessionConfigOptionCategory::Model)
+        ) || option.id.to_string() == "model"
+    })?;
+
+    let acp::SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+
+    let options = match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(entries) => entries
+            .iter()
+            .map(|entry| AcpModelOption {
+                value: entry.value.to_string(),
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+            })
+            .collect::<Vec<_>>(),
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| {
+                group.options.iter().map(|entry| AcpModelOption {
+                    value: entry.value.to_string(),
+                    name: format!("{} / {}", group.name, entry.name),
+                    description: entry.description.clone(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+
+    Some(AcpModelSelector {
+        config_id: option.id.to_string(),
+        current_value: select.current_value.to_string(),
+        options,
+    })
+}
+
+fn apply_preferred_model_to_selector(
+    selector: &mut Option<AcpModelSelector>,
+    preferred_model: Option<&str>,
+) {
+    if let (Some(preferred_model), Some(selector)) = (preferred_model, selector.as_mut()) {
+        if selector
+            .options
+            .iter()
+            .any(|option| option.value == preferred_model)
+        {
+            selector.current_value = preferred_model.to_string();
+        }
+    }
+}
+
+fn collect_render_output_files(root_dir: &Path) -> Result<Vec<GeneratedFile>> {
+    fn walk(base: &Path, current: &Path, files: &mut Vec<GeneratedFile>) -> Result<()> {
+        for entry in std::fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(base)?;
+
+            if relative
+                .components()
+                .next()
+                .is_some_and(|component| component.as_os_str() == "_context")
+            {
+                continue;
+            }
+
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                walk(base, &path, files)?;
+            } else if metadata.is_file() {
+                files.push(GeneratedFile {
+                    path: relative.display().to_string(),
+                    absolute_path: path.display().to_string(),
+                    bytes: metadata.len() as usize,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(root_dir, root_dir, &mut files)?;
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use std::fs;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    struct TestVibeServer {
+        base_url: String,
+        shutdown_tx: Option<oneshot::Sender<()>>,
+    }
+
+    impl Drop for TestVibeServer {
+        fn drop(&mut self) {
+            if let Some(shutdown_tx) = self.shutdown_tx.take() {
+                let _ = shutdown_tx.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn renders_discovered_vibe_document_end_to_end() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let script_path = write_stub_agent_script(temp_dir.path())?;
+        let python = find_python_command()?;
+        let server = start_test_vibe_server(
+            r#"# VIBE.md
+
+## Service
+
+Name: Signal Garden
+
+## Instructions
+
+Render a landing page for developers.
+"#,
+        )
+        .await?;
+
+        let settings = VibeAgentSettings {
+            command: format!("{} {}", python, script_path.display()),
+            workdir: None,
+            my_vibes: None,
+        };
+
+        let result =
+            visit_vibe_url_inner(&server.base_url, None, &settings, temp_dir.path()).await?;
+
+        assert_eq!(result.source_url, server.base_url);
+        assert!(result.discovered_url.ends_with("/.well-known/VIBE.md"));
+        assert!(result.html.contains("Signal Garden"));
+        assert!(result.html.contains("Rendered from VIBE.md"));
+        assert!(!result.fallback_used);
+        assert_eq!(result.stop_reason, "EndTurn");
+        assert!(
+            result
+                .generated_files
+                .iter()
+                .any(|file| file.path == "index.html"),
+            "expected index.html to be written by the ACP agent"
+        );
+        assert!(Path::new(&result.index_path).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn preferred_model_overrides_selector_when_available() {
+        let mut selector = Some(AcpModelSelector {
+            config_id: "model".to_string(),
+            current_value: "openai/gpt-5.4/medium".to_string(),
+            options: vec![
+                AcpModelOption {
+                    value: "openai/gpt-5.4/medium".to_string(),
+                    name: "GPT-5.4 Medium".to_string(),
+                    description: None,
+                },
+                AcpModelOption {
+                    value: "openai/gpt-5.4/high".to_string(),
+                    name: "GPT-5.4 High".to_string(),
+                    description: None,
+                },
+            ],
+        });
+
+        apply_preferred_model_to_selector(&mut selector, Some("openai/gpt-5.4/high"));
+
+        assert_eq!(
+            selector.as_ref().map(|value| value.current_value.as_str()),
+            Some("openai/gpt-5.4/high")
+        );
+    }
+
+    #[test]
+    fn user_instructions_section_is_high_priority_and_embedded() {
+        let section = format_user_instructions_section(Some("Always prefer austere layouts."));
+
+        assert!(section.contains("## User Instructions"));
+        assert!(section.contains("higher priority than every other instruction"));
+        assert!(section.contains("Always prefer austere layouts."));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires opencode acp and a working opencode model configuration"]
+    async fn renders_discovered_vibe_document_with_opencode() -> Result<()> {
+        if std::process::Command::new("opencode")
+            .arg("acp")
+            .arg("--help")
+            .output()
+            .is_err()
+        {
+            return Err(anyhow!("opencode is not installed"));
+        }
+
+        let temp_dir = TempDir::new()?;
+        let server = start_test_vibe_server(
+            r#"# VIBE.md
+
+## Service
+
+Name: Signal Garden
+
+## Instructions
+
+Create a self-contained HTML page that includes the exact text "Signal Garden" and the exact text "Rendered from VIBE.md".
+"#,
+        )
+        .await?;
+
+        let settings = VibeAgentSettings {
+            command: "opencode acp".to_string(),
+            workdir: None,
+            my_vibes: None,
+        };
+
+        let result =
+            visit_vibe_url_inner(&server.base_url, None, &settings, temp_dir.path()).await?;
+
+        assert!(result.html.contains("Signal Garden"));
+        assert!(result.html.contains("Rendered from VIBE.md"));
+        assert!(
+            result
+                .generated_files
+                .iter()
+                .any(|file| file.path == "index.html"),
+            "expected opencode to write index.html"
+        );
+
+        Ok(())
+    }
+
+    async fn start_test_vibe_server(vibe_markdown: &str) -> Result<TestVibeServer> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let body = vibe_markdown.to_string();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accept_result = listener.accept() => {
+                        let Ok((mut stream, _)) = accept_result else { break; };
+                        let body = body.clone();
+                        tokio::spawn(async move {
+                            let mut request_bytes = vec![0_u8; 4096];
+                            let read = match stream.read(&mut request_bytes).await {
+                                Ok(read) => read,
+                                Err(_) => return,
+                            };
+                            if read == 0 {
+                                return;
+                            }
+
+                            let request = String::from_utf8_lossy(&request_bytes[..read]);
+                            let path = request
+                                .lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .unwrap_or("/");
+
+                            let (status, response_body) = if matches!(path, "/.well-known/VIBE.md" | "/VIBE.md") {
+                                ("200 OK", body)
+                            } else {
+                                ("404 Not Found", "not found".to_string())
+                            };
+
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: text/markdown; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                response_body.len(),
+                                response_body
+                            );
+
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            let _ = stream.shutdown().await;
+                        });
+                    }
+                }
+            }
+        });
+
+        Ok(TestVibeServer {
+            base_url: format!("http://{}", address),
+            shutdown_tx: Some(shutdown_tx),
+        })
+    }
+
+    fn write_stub_agent_script(base_dir: &Path) -> Result<PathBuf> {
+        let script_path = base_dir.join("stub_acp_agent.py");
+        let script = r#"#!/usr/bin/env python3
+import json
+import re
+import sys
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+    return json.loads(line)
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+def extract_render_path(prompt_blocks):
+    prompt_text = "\n".join(
+        block.get("text", "")
+        for block in prompt_blocks
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+    match = re.search(r"exact absolute path:\s*`([^`]+)`", prompt_text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        raise RuntimeError("render path not found in prompt")
+    return match.group(1)
+
+while True:
+    message = recv()
+    method = message.get("method")
+    request_id = message.get("id")
+    params = message.get("params") or {}
+
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": params.get("protocolVersion", 1),
+                "agentCapabilities": {},
+                "authMethods": [],
+                "agentInfo": {
+                    "name": "stub-acp-agent",
+                    "version": "0.1.0",
+                    "title": "Stub ACP Agent"
+                }
+            }
+        })
+        continue
+
+    if method == "session/new":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "sessionId": "stub-session"
+            }
+        })
+        continue
+
+    if method == "session/prompt":
+        render_path = extract_render_path(params.get("prompt", []))
+        html = "<!doctype html><html><body><main><h1>Signal Garden</h1><p>Rendered from VIBE.md</p></main></body></html>"
+        file_request_id = 1001
+
+        send({
+            "jsonrpc": "2.0",
+            "id": file_request_id,
+            "method": "fs/write_text_file",
+            "params": {
+                "sessionId": params.get("sessionId", "stub-session"),
+                "path": render_path,
+                "content": html
+            }
+        })
+
+        while True:
+            response = recv()
+            if response.get("id") == file_request_id:
+                break
+
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "stopReason": "end_turn"
+            }
+        })
+        continue
+
+    if request_id is not None:
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": f"Method not found: {method}"
+            }
+        })
+"#;
+
+        fs::write(&script_path, script)?;
+        Ok(script_path)
+    }
+
+    fn find_python_command() -> Result<&'static str> {
+        for candidate in ["python3", "python"] {
+            if std::process::Command::new(candidate)
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                return Ok(candidate);
+            }
+        }
+
+        Err(anyhow!("python is required to run the ACP stub agent test"))
+    }
 }

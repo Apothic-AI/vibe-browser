@@ -18,8 +18,16 @@ When you visit a URL, Vibe Browser:
 5. Exposes ACP file write/read capabilities inside a dedicated Vibe render cache directory
 6. Instructs the agent to write a renderable `index.html`
 7. Renders the produced page inside the browser UI
+8. Keeps a structured ACP traffic log so you can inspect the browser-agent exchange
 
 For now, discovered integrations such as MCP servers, Skills, A2A, OpenAPI, and other endpoints are forwarded to the agent as plain `VIBE.md` content. The browser does not interpret them specially yet.
+
+## UI layout
+
+- The rendered page owns the main canvas under the top bar
+- The left-side rail is a real browser tab strip with add, select, and close behavior
+- A right-side details drawer is collapsed by default and can be opened from the top bar for session state, discovery attempts, ACP traffic, agent notes, and the discovered `VIBE.md`
+- The model selector lives inside the `ACP Agent` settings panel, not in the top bar
 
 ## Current structure
 
@@ -44,6 +52,12 @@ The browser lets you configure:
 
 - ACP agent command
 - optional ACP agent working directory
+- ACP model selection from the agent’s reported `configOptions`
+- `My Vibes`, a saved system-prompt-style instruction block that is injected into the ACP render prompt as `User Instructions`
+
+The selected ACP model is persisted, so the browser reuses it across renders and app restarts when that model is still available from the agent.
+
+`My Vibes` is also persisted. When present, the render prompt includes a dedicated `User Instructions` section that explicitly tells the ACP agent to treat those instructions as higher priority than the rest of the prompt, the embedded Vibe Protocol spec, and the discovered `VIBE.md`.
 
 You can set any shell command in the UI that starts the ACP process Vibe Browser should use.
 
@@ -83,3 +97,5 @@ sudo apt install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3
 
 - `pnpm build` should pass for the Solid frontend
 - `pnpm tauri dev` should now get through the local Tauri startup path on a machine with the Debian WebKit/GTK packages installed
+- `cargo test renders_discovered_vibe_document_end_to_end -- --nocapture` runs the backend end-to-end render test for `URL -> VIBE.md discovery -> ACP agent -> index.html`
+- `cargo test renders_discovered_vibe_document_with_opencode -- --ignored --nocapture` runs the same path against a real `opencode acp` process when OpenCode is installed and configured
