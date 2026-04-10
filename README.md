@@ -111,5 +111,6 @@ Release flow:
 
 1. Update the version in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`.
 2. Commit the version bump.
-3. Create and push a tag like `v0.1.0`.
-4. GitHub Actions builds and uploads the Windows NSIS installer plus Linux `deb` and `rpm` bundles to a GitHub release.
+3. Merge or push the version bump to `master`.
+4. CI validates that all three version files match and creates the missing tag `v<package.json version>`.
+5. The tag-triggered release workflow builds and uploads the Windows NSIS installer plus Linux `deb` and `rpm` bundles to a GitHub release.
