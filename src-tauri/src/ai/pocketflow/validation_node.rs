@@ -1,4 +1,4 @@
-use super::super::{WorkflowNode, ComponentGenerationResponse, ValidationStatus};
+use super::super::{ComponentGenerationResponse, ValidationStatus, WorkflowNode};
 use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
@@ -26,7 +26,10 @@ impl ValidationNode {
     }
 
     /// Perform comprehensive validation of the generated component
-    fn validate_component(&self, component: &ComponentGenerationResponse) -> Result<ValidationResult> {
+    fn validate_component(
+        &self,
+        component: &ComponentGenerationResponse,
+    ) -> Result<ValidationResult> {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
         let mut suggestions = Vec::new();
@@ -99,17 +102,23 @@ impl ValidationNode {
     }
 
     /// Validate SolidJS specific patterns and imports
-    fn validate_solidjs_patterns(&self, code: &str, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
+    fn validate_solidjs_patterns(
+        &self,
+        code: &str,
+        errors: &mut Vec<String>,
+        warnings: &mut Vec<String>,
+    ) {
         // Check for SolidJS imports
-        let has_solid_import = code.contains("from \"solid-js\"") || code.contains("from 'solid-js'");
-        
+        let has_solid_import =
+            code.contains("from \"solid-js\"") || code.contains("from 'solid-js'");
+
         // Check if SolidJS features are used
-        let uses_solid_features = code.contains("createSignal") || 
-                                 code.contains("createMemo") || 
-                                 code.contains("createEffect") ||
-                                 code.contains("Show") ||
-                                 code.contains("For") ||
-                                 code.contains("Switch");
+        let uses_solid_features = code.contains("createSignal")
+            || code.contains("createMemo")
+            || code.contains("createEffect")
+            || code.contains("Show")
+            || code.contains("For")
+            || code.contains("Switch");
 
         if uses_solid_features && !has_solid_import {
             errors.push("Using SolidJS features without importing from 'solid-js'".to_string());
@@ -117,7 +126,9 @@ impl ValidationNode {
 
         // Check for proper JSX syntax
         if !code.contains("return") && (code.contains("<") && code.contains(">")) {
-            warnings.push("JSX elements found but no return statement - component may not render".to_string());
+            warnings.push(
+                "JSX elements found but no return statement - component may not render".to_string(),
+            );
         }
 
         // Check for proper component export
@@ -136,10 +147,16 @@ impl ValidationNode {
     }
 
     /// Validate TypeScript patterns and types
-    fn validate_typescript(&self, code: &str, warnings: &mut Vec<String>, suggestions: &mut Vec<String>) {
+    fn validate_typescript(
+        &self,
+        code: &str,
+        warnings: &mut Vec<String>,
+        suggestions: &mut Vec<String>,
+    ) {
         // Check for props interface
         if code.contains("props") && !code.contains("interface") && !code.contains("type") {
-            suggestions.push("Consider defining a TypeScript interface for component props".to_string());
+            suggestions
+                .push("Consider defining a TypeScript interface for component props".to_string());
         }
 
         // Check for any type usage
@@ -154,11 +171,19 @@ impl ValidationNode {
     }
 
     /// Validate accessibility features
-    fn validate_accessibility(&self, code: &str, warnings: &mut Vec<String>, suggestions: &mut Vec<String>) {
+    fn validate_accessibility(
+        &self,
+        code: &str,
+        warnings: &mut Vec<String>,
+        suggestions: &mut Vec<String>,
+    ) {
         // Check for interactive elements without proper accessibility
-        if (code.contains("<button") || code.contains("<div") && code.contains("onClick")) && 
-           !code.contains("aria-") && !code.contains("role=") {
-            suggestions.push("Consider adding ARIA attributes for better accessibility".to_string());
+        if (code.contains("<button") || code.contains("<div") && code.contains("onClick"))
+            && !code.contains("aria-")
+            && !code.contains("role=")
+        {
+            suggestions
+                .push("Consider adding ARIA attributes for better accessibility".to_string());
         }
 
         // Check for images without alt text
@@ -167,22 +192,27 @@ impl ValidationNode {
         }
 
         // Check for form inputs without labels
-        if code.contains("<input") && !code.contains("aria-label") && !code.contains("aria-labelledby") {
+        if code.contains("<input")
+            && !code.contains("aria-label")
+            && !code.contains("aria-labelledby")
+        {
             suggestions.push("Form inputs should have associated labels".to_string());
         }
 
         // Check for proper heading structure
         if let Ok(regex) = Regex::new(r"<h(\d)") {
-            let headings: Vec<i32> = regex.captures_iter(code)
+            let headings: Vec<i32> = regex
+                .captures_iter(code)
                 .filter_map(|cap| cap.get(1))
                 .filter_map(|m| m.as_str().parse().ok())
                 .collect();
-            
+
             if headings.len() > 1 {
                 let mut prev = 0;
                 for &level in &headings {
                     if prev != 0 && level > prev + 1 {
-                        suggestions.push("Heading levels should not skip (e.g., h1 to h3)".to_string());
+                        suggestions
+                            .push("Heading levels should not skip (e.g., h1 to h3)".to_string());
                         break;
                     }
                     prev = level;
@@ -192,7 +222,12 @@ impl ValidationNode {
     }
 
     /// Validate best practices
-    fn validate_best_practices(&self, code: &str, warnings: &mut Vec<String>, suggestions: &mut Vec<String>) {
+    fn validate_best_practices(
+        &self,
+        code: &str,
+        warnings: &mut Vec<String>,
+        suggestions: &mut Vec<String>,
+    ) {
         // Check for inline styles (should prefer CSS classes)
         if code.contains("style={{") || code.contains("style=\"") {
             suggestions.push("Consider using CSS classes instead of inline styles".to_string());
@@ -234,7 +269,8 @@ impl ValidationNode {
 
         // Check for external script inclusion
         if code.contains("<script") && code.contains("src=") {
-            warnings.push("External scripts can pose security risks - validate sources".to_string());
+            warnings
+                .push("External scripts can pose security risks - validate sources".to_string());
         }
 
         // Check for localStorage usage without validation
@@ -244,14 +280,18 @@ impl ValidationNode {
     }
 
     /// Apply validation results to the component response
-    fn apply_validation_results(&self, mut component: ComponentGenerationResponse, validation: ValidationResult) -> ComponentGenerationResponse {
+    fn apply_validation_results(
+        &self,
+        mut component: ComponentGenerationResponse,
+        validation: ValidationResult,
+    ) -> ComponentGenerationResponse {
         component.validation_status = if !validation.is_valid {
             ValidationStatus::Error {
-                message: format!("Validation failed: {}", validation.errors.join(", "))
+                message: format!("Validation failed: {}", validation.errors.join(", ")),
             }
         } else if !validation.warnings.is_empty() {
             ValidationStatus::Warning {
-                message: format!("Validation warnings: {}", validation.warnings.join(", "))
+                message: format!("Validation warnings: {}", validation.warnings.join(", ")),
             }
         } else {
             ValidationStatus::Valid
@@ -263,19 +303,26 @@ impl ValidationNode {
 
 #[async_trait]
 impl WorkflowNode for ValidationNode {
-    async fn execute(&self, inputs: HashMap<String, serde_json::Value>) -> Result<HashMap<String, serde_json::Value>> {
+    async fn execute(
+        &self,
+        inputs: HashMap<String, serde_json::Value>,
+    ) -> Result<HashMap<String, serde_json::Value>> {
         let component: ComponentGenerationResponse = serde_json::from_value(
-            inputs.get("generated_component")
+            inputs
+                .get("generated_component")
                 .ok_or_else(|| anyhow::anyhow!("Missing 'generated_component' input"))?
-                .clone()
+                .clone(),
         )?;
 
         let validation_result = self.validate_component(&component)?;
         let validated_component = self.apply_validation_results(component, validation_result);
-        
+
         let mut outputs = HashMap::new();
-        outputs.insert("response".to_string(), serde_json::to_value(&validated_component)?);
-        
+        outputs.insert(
+            "response".to_string(),
+            serde_json::to_value(&validated_component)?,
+        );
+
         Ok(outputs)
     }
 
@@ -289,7 +336,9 @@ impl WorkflowNode for ValidationNode {
 
     fn validate_inputs(&self, inputs: &HashMap<String, serde_json::Value>) -> Result<()> {
         if !inputs.contains_key("generated_component") {
-            return Err(anyhow::anyhow!("Missing required input: generated_component"));
+            return Err(anyhow::anyhow!(
+                "Missing required input: generated_component"
+            ));
         }
         Ok(())
     }

@@ -85,12 +85,14 @@ impl VertexProvider {
         let (project_id, location) = if let Some(ref url) = config.base_url {
             // Extract from URL like: https://us-central1-aiplatform.googleapis.com/v1/projects/PROJECT_ID/locations/us-central1
             let parts: Vec<&str> = url.split('/').collect();
-            let project_id = parts.iter()
+            let project_id = parts
+                .iter()
                 .position(|&x| x == "projects")
                 .and_then(|i| parts.get(i + 1))
                 .map_or("default-project", |v| v)
                 .to_string();
-            let location = parts.iter()
+            let location = parts
+                .iter()
                 .position(|&x| x == "locations")
                 .and_then(|i| parts.get(i + 1))
                 .map_or("us-central1", |v| v)
@@ -101,8 +103,10 @@ impl VertexProvider {
         };
 
         let base_url = config.base_url.unwrap_or_else(|| {
-            format!("https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}", 
-                   location, project_id, location)
+            format!(
+                "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}",
+                location, project_id, location
+            )
         });
 
         Ok(Self {
@@ -155,7 +159,7 @@ impl VertexProvider {
 impl AIProvider for VertexProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let messages = self.build_messages(&request);
-        
+
         let vertex_request = VertexRequest {
             instances: vec![VertexInstance { messages }],
             parameters: VertexParameters {
@@ -166,9 +170,13 @@ impl AIProvider for VertexProvider {
             },
         };
 
-        let endpoint = format!("{}/publishers/google/models/{}:predict", self.base_url, self.model);
+        let endpoint = format!(
+            "{}/publishers/google/models/{}:predict",
+            self.base_url, self.model
+        );
 
-        let response = self.client
+        let response = self
+            .client
             .post(&endpoint)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -177,18 +185,23 @@ impl AIProvider for VertexProvider {
             .await?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(anyhow::anyhow!("Vertex AI API error: {}", error_text));
         }
 
         let vertex_response: VertexResponse = response.json().await?;
-        
-        let prediction = vertex_response.predictions
+
+        let prediction = vertex_response
+            .predictions
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No predictions in Vertex AI response"))?;
 
-        let candidate = prediction.candidates
+        let candidate = prediction
+            .candidates
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No candidates in Vertex AI prediction"))?;

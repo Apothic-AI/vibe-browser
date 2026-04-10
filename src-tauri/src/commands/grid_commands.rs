@@ -1,9 +1,9 @@
 use crate::commands::CommandResponse;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-use once_cell::sync::Lazy;
 
 /// Grid layout configuration
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -40,7 +40,7 @@ pub struct GridPosition {
 }
 
 /// Thread-safe in-memory grid storage (in a real app, this would be in the database)
-static GRID_STORAGE: Lazy<Arc<Mutex<HashMap<String, GridConfig>>>> = 
+static GRID_STORAGE: Lazy<Arc<Mutex<HashMap<String, GridConfig>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 fn get_grid_storage() -> Arc<Mutex<HashMap<String, GridConfig>>> {
@@ -70,7 +70,10 @@ pub async fn create_grid_config(
         updated_at: chrono::Utc::now(),
     };
 
-    get_grid_storage().lock().unwrap().insert(grid_config.id.clone(), grid_config.clone());
+    get_grid_storage()
+        .lock()
+        .unwrap()
+        .insert(grid_config.id.clone(), grid_config.clone());
 
     log::info!("Grid config created with ID: {}", grid_config.id);
     Ok(CommandResponse::success(grid_config))
@@ -78,15 +81,15 @@ pub async fn create_grid_config(
 
 /// Get grid configuration by ID
 #[tauri::command]
-pub async fn get_grid_config(
-    grid_id: String,
-) -> Result<CommandResponse<GridConfig>, String> {
+pub async fn get_grid_config(grid_id: String) -> Result<CommandResponse<GridConfig>, String> {
     let storage = get_grid_storage();
     let storage_guard = storage.lock().unwrap();
 
     match storage_guard.get(&grid_id) {
         Some(grid_config) => Ok(CommandResponse::success(grid_config.clone())),
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
@@ -136,24 +139,28 @@ pub async fn update_grid_config(
             log::info!("Updated grid config: {}", grid_id);
             Ok(CommandResponse::success(grid_config.clone()))
         }
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
 /// Delete grid configuration
 #[tauri::command]
-pub async fn delete_grid_config(
-    grid_id: String,
-) -> Result<CommandResponse<String>, String> {
+pub async fn delete_grid_config(grid_id: String) -> Result<CommandResponse<String>, String> {
     let storage = get_grid_storage();
     let mut storage_guard = storage.lock().unwrap();
 
     match storage_guard.remove(&grid_id) {
         Some(_) => {
             log::info!("Deleted grid config: {}", grid_id);
-            Ok(CommandResponse::success("Grid configuration deleted".to_string()))
+            Ok(CommandResponse::success(
+                "Grid configuration deleted".to_string(),
+            ))
         }
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
@@ -167,7 +174,11 @@ pub async fn add_component_to_grid(
     props: Option<HashMap<String, serde_json::Value>>,
     style_overrides: Option<HashMap<String, String>>,
 ) -> Result<CommandResponse<GridComponent>, String> {
-    log::info!("Adding component '{}' to grid '{}'", component_name, grid_id);
+    log::info!(
+        "Adding component '{}' to grid '{}'",
+        component_name,
+        grid_id
+    );
 
     let storage = get_grid_storage();
     let mut storage_guard = storage.lock().unwrap();
@@ -189,7 +200,9 @@ pub async fn add_component_to_grid(
             log::info!("Component added to grid with ID: {}", component.id);
             Ok(CommandResponse::success(component))
         }
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
@@ -204,14 +217,22 @@ pub async fn update_grid_component(
     props: Option<HashMap<String, serde_json::Value>>,
     style_overrides: Option<HashMap<String, String>>,
 ) -> Result<CommandResponse<GridComponent>, String> {
-    log::info!("Updating component '{}' in grid '{}'", component_id, grid_id);
+    log::info!(
+        "Updating component '{}' in grid '{}'",
+        component_id,
+        grid_id
+    );
 
     let storage = get_grid_storage();
     let mut storage_guard = storage.lock().unwrap();
 
     match storage_guard.get_mut(&grid_id) {
         Some(grid_config) => {
-            match grid_config.components.iter_mut().find(|c| c.id == component_id) {
+            match grid_config
+                .components
+                .iter_mut()
+                .find(|c| c.id == component_id)
+            {
                 Some(component) => {
                     if let Some(name) = component_name {
                         component.component_name = name;
@@ -234,10 +255,14 @@ pub async fn update_grid_component(
                     log::info!("Component '{}' updated in grid '{}'", component_id, grid_id);
                     Ok(CommandResponse::success(component.clone()))
                 }
-                None => Ok(CommandResponse::error("Component not found in grid".to_string()))
+                None => Ok(CommandResponse::error(
+                    "Component not found in grid".to_string(),
+                )),
             }
         }
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
@@ -247,7 +272,11 @@ pub async fn remove_component_from_grid(
     grid_id: String,
     component_id: String,
 ) -> Result<CommandResponse<String>, String> {
-    log::info!("Removing component '{}' from grid '{}'", component_id, grid_id);
+    log::info!(
+        "Removing component '{}' from grid '{}'",
+        component_id,
+        grid_id
+    );
 
     let storage = get_grid_storage();
     let mut storage_guard = storage.lock().unwrap();
@@ -256,16 +285,26 @@ pub async fn remove_component_from_grid(
         Some(grid_config) => {
             let initial_len = grid_config.components.len();
             grid_config.components.retain(|c| c.id != component_id);
-            
+
             if grid_config.components.len() < initial_len {
                 grid_config.updated_at = chrono::Utc::now();
-                log::info!("Component '{}' removed from grid '{}'", component_id, grid_id);
-                Ok(CommandResponse::success("Component removed from grid".to_string()))
+                log::info!(
+                    "Component '{}' removed from grid '{}'",
+                    component_id,
+                    grid_id
+                );
+                Ok(CommandResponse::success(
+                    "Component removed from grid".to_string(),
+                ))
             } else {
-                Ok(CommandResponse::error("Component not found in grid".to_string()))
+                Ok(CommandResponse::error(
+                    "Component not found in grid".to_string(),
+                ))
             }
         }
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
@@ -279,15 +318,15 @@ pub async fn get_grid_components(
 
     match storage_guard.get(&grid_id) {
         Some(grid_config) => Ok(CommandResponse::success(grid_config.components.clone())),
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
 /// Generate CSS for a grid layout
 #[tauri::command]
-pub async fn generate_grid_css(
-    grid_id: String,
-) -> Result<CommandResponse<String>, String> {
+pub async fn generate_grid_css(grid_id: String) -> Result<CommandResponse<String>, String> {
     let storage = get_grid_storage();
     let storage_guard = storage.lock().unwrap();
 
@@ -340,54 +379,59 @@ pub async fn generate_grid_css(
             let full_css = format!("{}{}", css, component_css);
             Ok(CommandResponse::success(full_css))
         }
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
 /// Export grid configuration as JSON
 #[tauri::command]
-pub async fn export_grid_config(
-    grid_id: String,
-) -> Result<CommandResponse<String>, String> {
+pub async fn export_grid_config(grid_id: String) -> Result<CommandResponse<String>, String> {
     let storage = get_grid_storage();
     let storage_guard = storage.lock().unwrap();
 
     match storage_guard.get(&grid_id) {
-        Some(grid_config) => {
-            match serde_json::to_string_pretty(grid_config) {
-                Ok(json) => {
-                    log::info!("Exported grid config '{}' to JSON", grid_id);
-                    Ok(CommandResponse::success(json))
-                }
-                Err(e) => {
-                    log::error!("Failed to serialize grid config: {}", e);
-                    Ok(CommandResponse::error("Failed to export grid configuration".to_string()))
-                }
+        Some(grid_config) => match serde_json::to_string_pretty(grid_config) {
+            Ok(json) => {
+                log::info!("Exported grid config '{}' to JSON", grid_id);
+                Ok(CommandResponse::success(json))
             }
-        }
-        None => Ok(CommandResponse::error("Grid configuration not found".to_string()))
+            Err(e) => {
+                log::error!("Failed to serialize grid config: {}", e);
+                Ok(CommandResponse::error(
+                    "Failed to export grid configuration".to_string(),
+                ))
+            }
+        },
+        None => Ok(CommandResponse::error(
+            "Grid configuration not found".to_string(),
+        )),
     }
 }
 
 /// Import grid configuration from JSON
 #[tauri::command]
-pub async fn import_grid_config(
-    json_data: String,
-) -> Result<CommandResponse<GridConfig>, String> {
+pub async fn import_grid_config(json_data: String) -> Result<CommandResponse<GridConfig>, String> {
     match serde_json::from_str::<GridConfig>(&json_data) {
         Ok(mut grid_config) => {
             // Generate new ID to avoid conflicts
             grid_config.id = Uuid::new_v4().to_string();
             grid_config.updated_at = chrono::Utc::now();
 
-            get_grid_storage().lock().unwrap().insert(grid_config.id.clone(), grid_config.clone());
+            get_grid_storage()
+                .lock()
+                .unwrap()
+                .insert(grid_config.id.clone(), grid_config.clone());
 
             log::info!("Imported grid config with new ID: {}", grid_config.id);
             Ok(CommandResponse::success(grid_config))
         }
         Err(e) => {
             log::error!("Failed to parse grid config JSON: {}", e);
-            Ok(CommandResponse::error("Invalid grid configuration JSON".to_string()))
+            Ok(CommandResponse::error(
+                "Invalid grid configuration JSON".to_string(),
+            ))
         }
     }
 }

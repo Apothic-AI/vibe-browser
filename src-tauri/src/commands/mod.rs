@@ -1,8 +1,10 @@
 pub mod ai_commands;
 pub mod grid_commands;
+pub mod vibe_commands;
 
 pub use ai_commands::*;
 pub use grid_commands::*;
+pub use vibe_commands::*;
 
 use serde::{Deserialize, Serialize};
 

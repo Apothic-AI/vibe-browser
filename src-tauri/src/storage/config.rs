@@ -1,7 +1,7 @@
 use crate::ai::AIProviderConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 
 /// Configuration manager for storing application settings and AI provider configurations
@@ -81,11 +81,13 @@ impl ConfigManager {
 
     /// Get an AI provider configuration by name
     pub async fn get_ai_provider(&self, name: &str) -> Result<Option<AIProviderConfig>> {
-        let row = sqlx::query(r#"
+        let row = sqlx::query(
+            r#"
             SELECT provider_type, api_key, base_url, model, max_tokens, temperature
             FROM ai_providers 
             WHERE name = ?
-        "#)
+        "#,
+        )
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
@@ -109,12 +111,14 @@ impl ConfigManager {
 
     /// Get all AI provider configurations
     pub async fn list_ai_providers(&self) -> Result<Vec<AIProviderEntry>> {
-        let rows = sqlx::query(r#"
+        let rows = sqlx::query(
+            r#"
             SELECT id, provider_type, name, api_key, base_url, model, max_tokens, 
                    temperature, is_active, created_at, updated_at
             FROM ai_providers 
             ORDER BY updated_at DESC
-        "#)
+        "#,
+        )
         .fetch_all(&self.pool)
         .await?;
 
@@ -159,11 +163,13 @@ impl ConfigManager {
             .await?;
 
         // Then activate the specified provider
-        let result = sqlx::query(r#"
+        let result = sqlx::query(
+            r#"
             UPDATE ai_providers 
             SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP
             WHERE name = ?
-        "#)
+        "#,
+        )
         .bind(name)
         .execute(&self.pool)
         .await?;
@@ -178,12 +184,14 @@ impl ConfigManager {
 
     /// Get the currently active AI provider
     pub async fn get_active_provider(&self) -> Result<Option<AIProviderConfig>> {
-        let row = sqlx::query(r#"
+        let row = sqlx::query(
+            r#"
             SELECT provider_type, api_key, base_url, model, max_tokens, temperature
             FROM ai_providers 
             WHERE is_active = TRUE
             LIMIT 1
-        "#)
+        "#,
+        )
         .fetch_optional(&self.pool)
         .await?;
 
@@ -222,11 +230,13 @@ impl ConfigManager {
     /// Store application configuration
     pub async fn store_app_config(&self, config: &AppConfig) -> Result<()> {
         let config_json = serde_json::to_string(config)?;
-        
-        sqlx::query(r#"
+
+        sqlx::query(
+            r#"
             INSERT OR REPLACE INTO configuration (key, value, updated_at)
             VALUES ('app_config', ?, CURRENT_TIMESTAMP)
-        "#)
+        "#,
+        )
         .bind(&config_json)
         .execute(&self.pool)
         .await?;
@@ -243,8 +253,7 @@ impl ConfigManager {
 
         if let Some(row) = row {
             let config_json: String = row.get("value");
-            let config: AppConfig = serde_json::from_str(&config_json)
-                .unwrap_or_default();
+            let config: AppConfig = serde_json::from_str(&config_json).unwrap_or_default();
             Ok(config)
         } else {
             // Return default configuration if not found
@@ -256,10 +265,12 @@ impl ConfigManager {
 
     /// Store a generic configuration value
     pub async fn set_config_value(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(r#"
+        sqlx::query(
+            r#"
             INSERT OR REPLACE INTO configuration (key, value, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
-        "#)
+        "#,
+        )
         .bind(key)
         .bind(value)
         .execute(&self.pool)

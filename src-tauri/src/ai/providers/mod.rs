@@ -1,9 +1,9 @@
 pub mod openrouter;
 pub mod vertex;
 
+pub use self::AIProviderEnum as ConcreteAIProvider;
 pub use openrouter::OpenRouterProvider;
 pub use vertex::VertexProvider;
-pub use self::AIProviderEnum as ConcreteAIProvider;
 
 use super::AIProviderConfig;
 use anyhow::Result;
@@ -41,7 +41,7 @@ pub struct Usage {
 pub trait AIProvider: Send + Sync {
     /// Generate completion for the given request
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse>;
-    
+
     /// Generate streaming completion
     async fn stream_complete<F>(
         &self,
@@ -50,13 +50,13 @@ pub trait AIProvider: Send + Sync {
     ) -> Result<CompletionResponse>
     where
         F: Fn(String) + Send + Sync + 'static;
-    
+
     /// Get provider name
     fn provider_name(&self) -> &str;
-    
+
     /// Get available models
     async fn get_models(&self) -> Result<Vec<String>>;
-    
+
     /// Validate the provider configuration
     async fn validate_config(&self) -> Result<()>;
 }
@@ -86,7 +86,9 @@ impl AIProvider for AIProviderEnum {
         F: Fn(String) + Send + Sync + 'static,
     {
         match self {
-            AIProviderEnum::OpenRouter(provider) => provider.stream_complete(request, callback).await,
+            AIProviderEnum::OpenRouter(provider) => {
+                provider.stream_complete(request, callback).await
+            }
             AIProviderEnum::Vertex(provider) => provider.stream_complete(request, callback).await,
         }
     }
@@ -127,7 +129,10 @@ impl AIProviderFactory {
                 let provider = VertexProvider::new(config)?;
                 Ok(AIProviderEnum::Vertex(provider))
             }
-            _ => Err(anyhow::anyhow!("Unsupported provider type: {}", config.provider_type)),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported provider type: {}",
+                config.provider_type
+            )),
         }
     }
 

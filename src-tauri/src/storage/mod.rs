@@ -5,33 +5,37 @@ pub use cache::ComponentCache;
 pub use config::ConfigManager;
 
 use anyhow::Result;
-use sqlx::{SqlitePool, Row};
+use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 /// Initialize the application database
 pub async fn initialize_database(data_dir: &PathBuf) -> Result<SqlitePool> {
     // Ensure the data directory exists
     tokio::fs::create_dir_all(data_dir).await?;
-    
+
     let db_path = data_dir.join("vibe_browser.db");
-    let database_url = format!("sqlite:{}", db_path.display());
-    
+    let database_url = format!("sqlite://{}", db_path.display());
+
     log::info!("Initializing database at: {}", database_url);
-    
-    let pool = SqlitePool::connect(&database_url).await?;
-    
+
+    let connect_options = SqliteConnectOptions::from_str(&database_url)?.create_if_missing(true);
+
+    let pool = SqlitePool::connect_with(connect_options).await?;
+
     // Run migrations
     run_migrations(&pool).await?;
-    
+
     Ok(pool)
 }
 
 /// Run database migrations
 async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     log::info!("Running database migrations...");
-    
+
     // Create components cache table
-    sqlx::query(r#"
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS component_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             component_name TEXT NOT NULL,
@@ -43,23 +47,27 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP
         )
-    "#)
+    "#,
+    )
     .execute(pool)
     .await?;
 
     // Create configuration table
-    sqlx::query(r#"
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS configuration (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
-    "#)
+    "#,
+    )
     .execute(pool)
     .await?;
 
     // Create AI provider configurations table
-    sqlx::query(r#"
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS ai_providers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             provider_type TEXT NOT NULL,
@@ -73,12 +81,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
-    "#)
+    "#,
+    )
     .execute(pool)
     .await?;
 
     // Create generation history table
-    sqlx::query(r#"
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS generation_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT NOT NULL,
@@ -92,23 +102,28 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             tokens_used INTEGER,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
-    "#)
+    "#,
+    )
     .execute(pool)
     .await?;
 
     // Create indices for better performance
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_component_cache_hash ON component_cache(requirements_hash)")
-        .execute(pool)
-        .await?;
-    
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_component_cache_accessed ON component_cache(last_accessed)")
-        .execute(pool)
-        .await?;
-    
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_component_cache_hash ON component_cache(requirements_hash)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_component_cache_accessed ON component_cache(last_accessed)",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_generation_history_session ON generation_history(session_id)")
         .execute(pool)
         .await?;
-    
+
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_generation_history_created ON generation_history(created_at)")
         .execute(pool)
         .await?;
@@ -139,24 +154,24 @@ pub fn get_data_dir() -> Result<PathBuf> {
 
 /// Database health check
 pub async fn health_check(pool: &SqlitePool) -> Result<()> {
-    let row = sqlx::query("SELECT 1 as health")
-        .fetch_one(pool)
-        .await?;
-    
+    let row = sqlx::query("SELECT 1 as health").fetch_one(pool).await?;
+
     let health: i32 = row.get("health");
     if health != 1 {
         return Err(anyhow::anyhow!("Database health check failed"));
     }
-    
+
     Ok(())
 }
 
 /// Clean up old cache entries (older than 30 days)
 pub async fn cleanup_old_cache(pool: &SqlitePool) -> Result<u64> {
-    let result = sqlx::query(r#"
+    let result = sqlx::query(
+        r#"
         DELETE FROM component_cache 
         WHERE last_accessed < datetime('now', '-30 days')
-    "#)
+    "#,
+    )
     .execute(pool)
     .await?;
 
@@ -196,14 +211,14 @@ async fn get_database_size(pool: &SqlitePool) -> Result<f64> {
     let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(pool)
         .await?;
-    
+
     let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
         .fetch_one(pool)
         .await?;
-    
+
     let size_bytes = page_count * page_size;
     let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
-    
+
     Ok(size_mb)
 }
 

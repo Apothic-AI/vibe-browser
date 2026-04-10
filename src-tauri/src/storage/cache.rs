@@ -1,7 +1,7 @@
 use crate::ai::ComponentGenerationResponse;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use sqlx::{SqlitePool, Row};
+use sqlx::{Row, SqlitePool};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -30,7 +30,12 @@ impl ComponentCache {
     }
 
     /// Generate a hash for the requirements to use as cache key
-    fn hash_requirements(&self, requirements: &str, component_type: &Option<String>, style_framework: &Option<String>) -> String {
+    fn hash_requirements(
+        &self,
+        requirements: &str,
+        component_type: &Option<String>,
+        style_framework: &Option<String>,
+    ) -> String {
         let mut hasher = DefaultHasher::new();
         requirements.hash(&mut hasher);
         component_type.hash(&mut hasher);
@@ -46,7 +51,8 @@ impl ComponentCache {
         style_framework: &Option<String>,
         response: &ComponentGenerationResponse,
     ) -> Result<i64> {
-        let requirements_hash = self.hash_requirements(requirements, component_type, style_framework);
+        let requirements_hash =
+            self.hash_requirements(requirements, component_type, style_framework);
         let dependencies_json = serde_json::to_string(&response.dependencies)?;
         let validation_status_json = serde_json::to_string(&response.validation_status)?;
 
@@ -64,7 +70,11 @@ impl ComponentCache {
         .execute(&self.pool)
         .await?;
 
-        log::info!("Cached component '{}' with hash '{}'", response.component_name, requirements_hash);
+        log::info!(
+            "Cached component '{}' with hash '{}'",
+            response.component_name,
+            requirements_hash
+        );
         Ok(result.last_insert_rowid())
     }
 
@@ -75,13 +85,16 @@ impl ComponentCache {
         component_type: &Option<String>,
         style_framework: &Option<String>,
     ) -> Result<Option<ComponentGenerationResponse>> {
-        let requirements_hash = self.hash_requirements(requirements, component_type, style_framework);
+        let requirements_hash =
+            self.hash_requirements(requirements, component_type, style_framework);
 
-        let row = sqlx::query(r#"
+        let row = sqlx::query(
+            r#"
             SELECT component_name, component_code, description, dependencies, validation_status
             FROM component_cache 
             WHERE requirements_hash = ?
-        "#)
+        "#,
+        )
         .bind(&requirements_hash)
         .fetch_optional(&self.pool)
         .await?;
@@ -99,7 +112,11 @@ impl ComponentCache {
             let dependencies: Vec<String> = serde_json::from_str(&dependencies_json)?;
             let validation_status = serde_json::from_str(&validation_status_json)?;
 
-            log::info!("Retrieved cached component '{}' with hash '{}'", component_name, requirements_hash);
+            log::info!(
+                "Retrieved cached component '{}' with hash '{}'",
+                component_name,
+                requirements_hash
+            );
 
             Ok(Some(ComponentGenerationResponse {
                 component_name,
@@ -116,11 +133,13 @@ impl ComponentCache {
 
     /// Update the last accessed time for a cached component
     async fn update_last_accessed(&self, requirements_hash: &str) -> Result<()> {
-        sqlx::query(r#"
+        sqlx::query(
+            r#"
             UPDATE component_cache 
             SET last_accessed = CURRENT_TIMESTAMP 
             WHERE requirements_hash = ?
-        "#)
+        "#,
+        )
         .bind(requirements_hash)
         .execute(&self.pool)
         .await?;
@@ -129,14 +148,20 @@ impl ComponentCache {
     }
 
     /// Get all cached components with pagination
-    pub async fn list_cached_components(&self, limit: i64, offset: i64) -> Result<Vec<CachedComponent>> {
-        let rows = sqlx::query(r#"
+    pub async fn list_cached_components(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CachedComponent>> {
+        let rows = sqlx::query(
+            r#"
             SELECT id, component_name, requirements_hash, component_code, description, 
                    dependencies, validation_status, created_at, last_accessed
             FROM component_cache 
             ORDER BY last_accessed DESC
             LIMIT ? OFFSET ?
-        "#)
+        "#,
+        )
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -145,8 +170,8 @@ impl ComponentCache {
         let mut components = Vec::new();
         for row in rows {
             let dependencies_json: String = row.get("dependencies");
-            let dependencies: Vec<String> = serde_json::from_str(&dependencies_json)
-                .unwrap_or_else(|_| vec![]);
+            let dependencies: Vec<String> =
+                serde_json::from_str(&dependencies_json).unwrap_or_else(|_| vec![]);
 
             let created_at_str: String = row.get("created_at");
             let last_accessed_str: String = row.get("last_accessed");
@@ -156,9 +181,10 @@ impl ComponentCache {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now());
 
-            let last_accessed = chrono::DateTime::parse_from_str(&last_accessed_str, "%Y-%m-%d %H:%M:%S")
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
+            let last_accessed =
+                chrono::DateTime::parse_from_str(&last_accessed_str, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
 
             components.push(CachedComponent {
                 id: row.get("id"),
@@ -212,13 +238,15 @@ impl ComponentCache {
             .fetch_one(&self.pool)
             .await?;
 
-        let total_size_bytes: i64 = sqlx::query_scalar("SELECT SUM(LENGTH(component_code)) FROM component_cache")
-            .fetch_one(&self.pool)
-            .await?;
+        let total_size_bytes: i64 =
+            sqlx::query_scalar("SELECT SUM(LENGTH(component_code)) FROM component_cache")
+                .fetch_one(&self.pool)
+                .await?;
 
-        let most_recent_row = sqlx::query("SELECT created_at FROM component_cache ORDER BY created_at DESC LIMIT 1")
-            .fetch_optional(&self.pool)
-            .await?;
+        let most_recent_row =
+            sqlx::query("SELECT created_at FROM component_cache ORDER BY created_at DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?;
 
         let last_update = if let Some(row) = most_recent_row {
             let created_at_str: String = row.get("created_at");
@@ -244,15 +272,17 @@ impl ComponentCache {
     /// Search for cached components by name or content
     pub async fn search_components(&self, query: &str, limit: i64) -> Result<Vec<CachedComponent>> {
         let search_pattern = format!("%{}%", query);
-        
-        let rows = sqlx::query(r#"
+
+        let rows = sqlx::query(
+            r#"
             SELECT id, component_name, requirements_hash, component_code, description, 
                    dependencies, validation_status, created_at, last_accessed
             FROM component_cache 
             WHERE component_name LIKE ? OR description LIKE ? OR component_code LIKE ?
             ORDER BY last_accessed DESC
             LIMIT ?
-        "#)
+        "#,
+        )
         .bind(&search_pattern)
         .bind(&search_pattern)
         .bind(&search_pattern)
@@ -263,8 +293,8 @@ impl ComponentCache {
         let mut components = Vec::new();
         for row in rows {
             let dependencies_json: String = row.get("dependencies");
-            let dependencies: Vec<String> = serde_json::from_str(&dependencies_json)
-                .unwrap_or_else(|_| vec![]);
+            let dependencies: Vec<String> =
+                serde_json::from_str(&dependencies_json).unwrap_or_else(|_| vec![]);
 
             let created_at_str: String = row.get("created_at");
             let last_accessed_str: String = row.get("last_accessed");
@@ -273,9 +303,10 @@ impl ComponentCache {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now());
 
-            let last_accessed = chrono::DateTime::parse_from_str(&last_accessed_str, "%Y-%m-%d %H:%M:%S")
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
+            let last_accessed =
+                chrono::DateTime::parse_from_str(&last_accessed_str, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
 
             components.push(CachedComponent {
                 id: row.get("id"),

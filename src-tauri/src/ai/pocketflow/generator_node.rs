@@ -1,5 +1,5 @@
-use super::super::{WorkflowNode, ComponentGenerationResponse, ValidationStatus};
 use super::super::providers::{AIProvider, CompletionRequest, ConcreteAIProvider};
+use super::super::{ComponentGenerationResponse, ValidationStatus, WorkflowNode};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -94,27 +94,33 @@ Ensure the component is production-ready and includes proper error handling wher
     fn parse_ai_response(&self, response_content: &str) -> Result<ComponentGenerationResponse> {
         // Try to parse as JSON first
         if let Ok(json_response) = serde_json::from_str::<serde_json::Value>(response_content) {
-            let component_code = json_response.get("component_code")
+            let component_code = json_response
+                .get("component_code")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            
-            let component_name = json_response.get("component_name")
+
+            let component_name = json_response
+                .get("component_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("GeneratedComponent")
                 .to_string();
-            
-            let description = json_response.get("description")
+
+            let description = json_response
+                .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Generated SolidJS component")
                 .to_string();
-            
-            let dependencies = json_response.get("dependencies")
+
+            let dependencies = json_response
+                .get("dependencies")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .collect()
+                })
                 .unwrap_or_else(|| vec!["solid-js".to_string()]);
 
             return Ok(ComponentGenerationResponse {
@@ -183,7 +189,7 @@ Ensure the component is production-ready and includes proper error handling wher
             }
         }
 
-        // Look for const ComponentName = 
+        // Look for const ComponentName =
         if let Ok(regex) = regex::Regex::new(r"const\s+(\w+)\s*=") {
             if let Some(captures) = regex.captures(code) {
                 if let Some(name) = captures.get(1) {
@@ -196,7 +202,10 @@ Ensure the component is production-ready and includes proper error handling wher
     }
 
     /// Generate component using AI provider
-    async fn generate_component(&self, requirements: &ProcessedRequirements) -> Result<ComponentGenerationResponse> {
+    async fn generate_component(
+        &self,
+        requirements: &ProcessedRequirements,
+    ) -> Result<ComponentGenerationResponse> {
         let system_prompt = self.build_system_prompt();
         let user_prompt = self.build_user_prompt(requirements);
 
@@ -215,24 +224,34 @@ Ensure the component is production-ready and includes proper error handling wher
 
 #[async_trait]
 impl WorkflowNode for GeneratorNode {
-    async fn execute(&self, inputs: HashMap<String, serde_json::Value>) -> Result<HashMap<String, serde_json::Value>> {
+    async fn execute(
+        &self,
+        inputs: HashMap<String, serde_json::Value>,
+    ) -> Result<HashMap<String, serde_json::Value>> {
         let requirements: ProcessedRequirements = serde_json::from_value(
-            inputs.get("processed_requirements")
+            inputs
+                .get("processed_requirements")
                 .ok_or_else(|| anyhow::anyhow!("Missing 'processed_requirements' input"))?
-                .clone()
+                .clone(),
         )?;
 
         let generated_component = self.generate_component(&requirements).await?;
-        
+
         let mut outputs = HashMap::new();
-        outputs.insert("generated_component".to_string(), serde_json::to_value(&generated_component)?);
-        
+        outputs.insert(
+            "generated_component".to_string(),
+            serde_json::to_value(&generated_component)?,
+        );
+
         // Pass through previous inputs for the validation node
         if let Some(original_request) = inputs.get("original_request") {
             outputs.insert("original_request".to_string(), original_request.clone());
         }
-        outputs.insert("processed_requirements".to_string(), serde_json::to_value(&requirements)?);
-        
+        outputs.insert(
+            "processed_requirements".to_string(),
+            serde_json::to_value(&requirements)?,
+        );
+
         Ok(outputs)
     }
 
@@ -246,7 +265,9 @@ impl WorkflowNode for GeneratorNode {
 
     fn validate_inputs(&self, inputs: &HashMap<String, serde_json::Value>) -> Result<()> {
         if !inputs.contains_key("processed_requirements") {
-            return Err(anyhow::anyhow!("Missing required input: processed_requirements"));
+            return Err(anyhow::anyhow!(
+                "Missing required input: processed_requirements"
+            ));
         }
         Ok(())
     }

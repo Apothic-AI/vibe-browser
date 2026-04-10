@@ -1,4 +1,4 @@
-use super::{StreamingEvent, StreamingEventType, ComponentGenerationResponse};
+use super::{ComponentGenerationResponse, StreamingEvent, StreamingEventType};
 use anyhow::Result;
 use serde_json;
 use tauri::{AppHandle, Emitter};
@@ -17,7 +17,8 @@ impl StreamingManager {
 
     /// Emit a streaming event to the frontend
     pub fn emit_event(&self, event: StreamingEvent) -> Result<()> {
-        self.app_handle.emit("ai_streaming_event", &event)
+        self.app_handle
+            .emit("ai_streaming_event", &event)
             .map_err(|e| anyhow::anyhow!("Failed to emit streaming event: {}", e))?;
         Ok(())
     }
@@ -33,14 +34,21 @@ impl StreamingManager {
     }
 
     /// Start a streaming session and return a channel for sending events
-    pub fn start_streaming_session(&self, session_id: String) -> mpsc::UnboundedSender<StreamingEvent> {
+    pub fn start_streaming_session(
+        &self,
+        session_id: String,
+    ) -> mpsc::UnboundedSender<StreamingEvent> {
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamingEvent>();
         let app_handle = self.app_handle.clone();
 
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 if let Err(e) = app_handle.emit("ai_streaming_event", &event) {
-                    log::error!("Failed to emit streaming event in session {}: {}", session_id, e);
+                    log::error!(
+                        "Failed to emit streaming event in session {}: {}",
+                        session_id,
+                        e
+                    );
                 }
 
                 // If this is a Complete or Error event, end the session
@@ -148,7 +156,7 @@ pub mod utils {
     {
         for (stage, progress) in stages {
             callback(progress_event(stage, progress));
-            
+
             if let Some(delay) = delay_ms {
                 tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
             }
@@ -159,7 +167,7 @@ pub mod utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{ValidationStatus};
+    use crate::ai::ValidationStatus;
 
     #[test]
     fn test_streaming_event_builder() {

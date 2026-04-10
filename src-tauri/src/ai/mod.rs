@@ -2,23 +2,26 @@ pub mod pocketflow;
 pub mod providers;
 pub mod streaming;
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Core trait for workflow nodes in the AI system
 #[async_trait]
 pub trait WorkflowNode: Send + Sync {
     /// Execute the node with given inputs and return outputs
-    async fn execute(&self, inputs: HashMap<String, serde_json::Value>) -> Result<HashMap<String, serde_json::Value>>;
-    
+    async fn execute(
+        &self,
+        inputs: HashMap<String, serde_json::Value>,
+    ) -> Result<HashMap<String, serde_json::Value>>;
+
     /// Get the node's unique identifier
     fn node_id(&self) -> &str;
-    
+
     /// Get the node's type/category
     fn node_type(&self) -> &str;
-    
+
     /// Validate inputs before execution
     fn validate_inputs(&self, inputs: &HashMap<String, serde_json::Value>) -> Result<()>;
 }

@@ -70,7 +70,8 @@ impl OpenRouterProvider {
             .timeout(Duration::from_secs(120))
             .build()?;
 
-        let base_url = config.base_url
+        let base_url = config
+            .base_url
             .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
 
         Ok(Self {
@@ -121,7 +122,7 @@ impl OpenRouterProvider {
 impl AIProvider for OpenRouterProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let messages = self.build_messages(&request);
-        
+
         let openrouter_request = OpenRouterRequest {
             model: self.model.clone(),
             messages,
@@ -131,7 +132,8 @@ impl AIProvider for OpenRouterProvider {
             stream: Some(false),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -142,20 +144,26 @@ impl AIProvider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(anyhow::anyhow!("OpenRouter API error: {}", error_text));
         }
 
         let openrouter_response: OpenRouterResponse = response.json().await?;
-        
-        let choice = openrouter_response.choices
+
+        let choice = openrouter_response
+            .choices
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No choices in OpenRouter response"))?;
 
         Ok(CompletionResponse {
             content: choice.message.content,
-            model: openrouter_response.model.unwrap_or_else(|| self.model.clone()),
+            model: openrouter_response
+                .model
+                .unwrap_or_else(|| self.model.clone()),
             usage: self.convert_usage(openrouter_response.usage),
             finish_reason: choice.finish_reason,
         })
@@ -181,7 +189,8 @@ impl AIProvider for OpenRouterProvider {
     }
 
     async fn get_models(&self) -> Result<Vec<String>> {
-        let response = self.client
+        let response = self
+            .client
             .get(&format!("{}/models", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()

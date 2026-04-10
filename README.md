@@ -1,179 +1,85 @@
 # Vibe Browser
 
-**Modern Desktop Prototype for AI-Powered Component Generation**
+Desktop demo for the current Vibe Protocol flow:
 
-A Tauri-based desktop application showcasing the integration of Rust backend services with SolidJS frontend for AI-powered development workflows. Built as a foundation for next-generation desktop development tools.
+`URL -> VIBE.md discovery -> ACP agent -> generated index.html -> browser render`
 
-## 🚀 What's Built
+## What it does
 
-### **Working Desktop Application**
-- Native desktop performance with Tauri 2.0
-- Modern SolidJS frontend with TailwindCSS
-- Professional UI with keyboard shortcuts (Ctrl/Cmd+K)
-- Real-time status indicators and responsive design
+When you visit a URL, Vibe Browser:
 
-### **Complete Backend Infrastructure** 
-- **24 Tauri commands** for AI and grid operations
-- **Multi-provider AI integration** (OpenRouter, Google Vertex AI)
-- **SQLite storage** with thread-safe caching
-- **Streaming event system** for real-time updates
+1. Tries `/.well-known/VIBE.md`, then `/VIBE.md`
+2. Downloads the discovered `VIBE.md`
+3. Builds a render prompt that includes:
+   - general Vibe Browser rendering instructions
+   - an embedded markdown section with the Vibe Protocol spec
+   - the full discovered `VIBE.md`
+4. Starts an ACP agent subprocess with the Rust `agent-client-protocol` crate
+5. Exposes ACP file write/read capabilities inside a dedicated Vibe render cache directory
+6. Instructs the agent to write a renderable `index.html`
+7. Renders the produced page inside the browser UI
 
-### **Production-Ready Architecture**
-- Rust backend with comprehensive error handling
-- Type-safe Tauri IPC communication
-- Extensible provider factory pattern
-- Modern development workflow
+For now, discovered integrations such as MCP servers, Skills, A2A, OpenAPI, and other endpoints are forwarded to the agent as plain `VIBE.md` content. The browser does not interpret them specially yet.
 
-## 📦 Technology Stack
+## Current structure
 
-- **Frontend**: SolidJS + TypeScript + Vite + TailwindCSS
-- **Backend**: Rust + Tauri 2.0 + SQLite
-- **Build System**: Cargo + Vite with hot reload
-- **Package Management**: pnpm
+Frontend:
 
-## ⚡ Quick Start
+- [src/App.tsx](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/src/App.tsx)
+- [src/App.css](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/src/App.css)
 
-### Prerequisites
-- Node.js 18+ with pnpm
-- Rust 1.70+ with cargo
-- Tauri CLI
+Backend:
 
-### Installation & Run
+- [src-tauri/src/commands/vibe_commands.rs](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/src-tauri/src/commands/vibe_commands.rs)
+- [src-tauri/src/lib.rs](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/src-tauri/src/lib.rs)
+
+Local discovery demo:
+
+- [public/.well-known/VIBE.md](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/public/.well-known/VIBE.md)
+- [public/VIBE.md](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/public/VIBE.md)
+
+## ACP agent settings
+
+The browser lets you configure:
+
+- ACP agent command
+- optional ACP agent working directory
+
+You can set any shell command in the UI that starts the ACP process Vibe Browser should use.
+
+Examples:
+
 ```bash
-# Navigate to project
-cd /home/zensin/Code/apothic/apps/vibe-browser
+opencode acp
+```
 
-# Install dependencies
+```bash
+uv run --project ../../yolo-python yolo-acp
+```
+
+The built-in default is:
+
+```bash
+opencode acp
+```
+
+The local `yolo-acp` command is still available as a quick-fill option in the UI when you want to test against the monorepo ACP agent instead.
+
+## Development
+
+```bash
 pnpm install
-
-# Launch desktop app
+pnpm build
 pnpm tauri dev
 ```
 
-The application will compile the Rust backend and launch the desktop app with hot reload enabled.
+On Debian 13 / Linux, Tauri also needs the WebKit and GTK development packages:
 
-## 💻 What You'll See
-
-**Demo Interface Features:**
-- Clean desktop application with animated search overlay
-- Keyboard shortcut activation (Ctrl/Cmd+K)
-- Status indicators showing system state
-- Component generation workflow (demo mode)
-- Error handling and user feedback
-
-**Backend Capabilities Ready:**
-- AI provider configuration system
-- Component caching infrastructure  
-- Grid layout management
-- Real-time event streaming
-
-## 🏗️ Architecture
-
-### Frontend (SolidJS)
-```
-src/
-├── App.tsx                  # Main application
-├── components/              # UI components
-│   ├── SearchOverlay.tsx    # Search interface
-│   └── DynaGridOverlay.tsx  # Grid layout
-├── stores/                  # State management
-└── services/                # API integration
-```
-
-### Backend (Rust)
-```
-src-tauri/src/
-├── ai/                      # AI workflow system
-│   ├── pocketflow/          # Workflow orchestration
-│   ├── providers/           # AI provider clients
-│   └── streaming.rs         # Event system
-├── storage/                 # SQLite operations
-│   ├── cache.rs             # Component caching
-│   └── config.rs            # Configuration
-└── commands/                # 24 Tauri commands
-```
-
-## 🔧 Available Commands
-
-The backend exposes 24 Tauri commands:
-
-**AI Operations** (13 commands):
-- Component generation and validation
-- AI provider configuration and management
-- Component caching and search
-- Real-time streaming
-
-**Grid System** (11 commands):
-- Grid configuration CRUD operations
-- Component placement and management
-- CSS generation and export/import
-
-## 🛠️ Development
-
-### Frontend Development
 ```bash
-pnpm dev              # Vite dev server
-pnpm build            # Production build
+sudo apt install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
 ```
 
-### Backend Development  
-```bash
-cd src-tauri
-cargo check           # Type checking
-cargo build           # Development build
-cargo test            # Run tests (when added)
-```
+## Verification
 
-### Desktop App
-```bash
-pnpm tauri dev        # Development with hot reload
-pnpm tauri build      # Production desktop build
-```
-
-## 🎯 Current Status
-
-**✅ Complete Infrastructure:**
-- Tauri 2.0 desktop application
-- 24 working Tauri commands
-- Thread-safe storage layer
-- AI provider abstraction
-- Modern SolidJS frontend
-
-**📋 Ready for Extension:**
-- Add API keys for live AI generation
-- Implement visual component rendering
-- Add comprehensive test coverage
-- Deploy to production
-
-## 🔮 Next Steps
-
-**Immediate** (Demo → Functional):
-1. Connect AI providers with API keys
-2. Implement component validation logic
-3. Add visual component rendering
-
-**Short-term** (Functional → Production):
-1. Comprehensive testing suite
-2. Error recovery mechanisms
-3. Performance optimization
-
-## 📊 Performance
-
-- **Startup**: ~1-2 seconds
-- **Memory**: ~50-100MB footprint  
-- **Build**: Fast compilation with Rust + Vite
-- **UI**: Native desktop responsiveness
-
-## 🏆 Key Achievement
-
-Demonstrates successful integration of:
-- **Modern Rust backend** with comprehensive AI infrastructure
-- **SolidJS frontend** with desktop-optimized UX
-- **Type-safe communication** via Tauri IPC
-- **Production-ready architecture** for complex desktop apps
-
-Perfect foundation for building advanced AI-powered development tools with native desktop performance.
-
----
-
-**Built with modern technologies, ready for the future of desktop development.**
+- `pnpm build` should pass for the Solid frontend
+- `pnpm tauri dev` should now get through the local Tauri startup path on a machine with the Debian WebKit/GTK packages installed
