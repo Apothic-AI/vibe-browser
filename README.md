@@ -102,3 +102,14 @@ sudo apt install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3
 - `cargo test renders_discovered_vibe_document_end_to_end -- --nocapture` runs the backend end-to-end render test for `URL -> published VIBE.md -> ACP agent -> index.html`
 - `cargo test infers_vibe_document_when_site_has_no_published_vibe -- --nocapture` runs the backend end-to-end render test for `URL -> inferred VIBE.md -> ACP agent -> index.html`
 - `cargo test renders_discovered_vibe_document_with_opencode -- --ignored --nocapture` runs the same path against a real `opencode acp` process when OpenCode is installed and configured
+
+## Releases
+
+GitHub Actions builds release bundles from version tags with the workflow at `.github/workflows/release.yml`.
+
+Release flow:
+
+1. Update the version in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`.
+2. Commit the version bump.
+3. Create and push a tag like `v0.1.0`.
+4. GitHub Actions builds and uploads the Windows NSIS installer plus Linux `deb` and `rpm` bundles to a GitHub release.
