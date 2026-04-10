@@ -726,24 +726,6 @@ function App() {
                 <Show when={tab().status === "ready" && tab().result}>
                   {(navigation) => (
                     <div class="render-stage">
-                      <div class="render-stage__overlay">
-                        <div>
-                          <div class="eyebrow">Rendered Output</div>
-                          <strong>
-                            {navigation().discovered_url}
-                          </strong>
-                        </div>
-                        <div class="status-row">
-                          <span class="status-chip">stop: {navigation().stop_reason}</span>
-                          <Show when={navigation().vibe_source === "inferred"}>
-                            <span class="status-chip status-chip--warning">inferred vibe</span>
-                          </Show>
-                          <Show when={navigation().fallback_used}>
-                            <span class="status-chip status-chip--warning">fallback html</span>
-                          </Show>
-                        </div>
-                      </div>
-
                       <iframe
                         class="preview-frame"
                         sandbox="allow-scripts allow-forms allow-modals"
