@@ -1,6 +1,6 @@
 # Vibe Browser
 
-Desktop demo for the current Vibe Protocol flow:
+Desktop demo for the current [Vibe Protocol](https://vibeprotocol.org) flow:
 
 `URL -> VIBE.md discovery or inference -> ACP agent -> generated index.html -> browser render`
 
@@ -42,6 +42,7 @@ Backend:
 
 - [src-tauri/src/commands/vibe_commands.rs](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/src-tauri/src/commands/vibe_commands.rs)
 - [src-tauri/src/lib.rs](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/src-tauri/src/lib.rs)
+- [src-tauri/VIBE-PROTOCOL-SPEC.md](/home/bitnom/Code/apothic-monorepo/apps/vibe-browser/src-tauri/VIBE-PROTOCOL-SPEC.md)
 
 Local discovery demo:
 

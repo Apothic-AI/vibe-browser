@@ -16,8 +16,8 @@ const VIBE_AGENT_COMMAND_KEY: &str = "vibe_agent_command";
 const VIBE_AGENT_WORKDIR_KEY: &str = "vibe_agent_workdir";
 const VIBE_AGENT_MODEL_KEY: &str = "vibe_agent_model";
 const VIBE_AGENT_MY_VIBES_KEY: &str = "vibe_agent_my_vibes";
-const VIBE_SPEC_MARKDOWN: &str =
-    include_str!("../../../../vibe-protocol-website/public/docs/VIBE.md");
+// Keep a local copy of the protocol spec so the standalone repo builds outside the monorepo.
+const VIBE_SPEC_MARKDOWN: &str = include_str!("../../VIBE-PROTOCOL-SPEC.md");
 
 #[derive(Clone)]
 pub struct VibeState {
