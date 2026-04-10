@@ -56,10 +56,13 @@ interface AcpTrafficEntry {
   payload: string;
 }
 
+type VibeDocumentSource = "published" | "inferred";
+
 interface VibeNavigationResult {
   source_url: string;
   normalized_url: string;
   discovered_url: string;
+  vibe_source: VibeDocumentSource;
   vibe_markdown: string;
   discovery_attempts: DiscoveryAttempt[];
   render_dir: string;
@@ -482,7 +485,7 @@ function App() {
           <div>
             <div class="brand-name">Vibe Browser</div>
             <div class="brand-subtitle">
-              discover VIBE.md, ask an ACP agent to render it, show the result
+              discover or infer VIBE.md, ask an ACP agent to render it, show the result
             </div>
           </div>
         </div>
@@ -537,7 +540,8 @@ function App() {
               <p>
                 Set any shell command here that starts the ACP process Vibe Browser should use.
                 The browser launches it, opens an ACP session, forwards the Vibe prompt plus the
-                discovered <code>VIBE.md</code>, and waits for <code>index.html</code>.
+                published or inferred <code>VIBE.md</code>, and waits for
+                <code> index.html</code>.
               </p>
             </div>
             <button type="button" class="ghost-action" onClick={() => setSettingsOpen(false)}>
@@ -725,10 +729,15 @@ function App() {
                       <div class="render-stage__overlay">
                         <div>
                           <div class="eyebrow">Rendered Output</div>
-                          <strong>{navigation().discovered_url}</strong>
+                          <strong>
+                            {navigation().discovered_url}
+                          </strong>
                         </div>
                         <div class="status-row">
                           <span class="status-chip">stop: {navigation().stop_reason}</span>
+                          <Show when={navigation().vibe_source === "inferred"}>
+                            <span class="status-chip status-chip--warning">inferred vibe</span>
+                          </Show>
                           <Show when={navigation().fallback_used}>
                             <span class="status-chip status-chip--warning">fallback html</span>
                           </Show>
@@ -751,8 +760,9 @@ function App() {
                       <div class="eyebrow">Rendering</div>
                       <h1>{tab().title}</h1>
                       <p>
-                        Discovering <code>VIBE.md</code>, opening ACP, forwarding the render job,
-                        and waiting for <code>index.html</code>.
+                        Running Vibe discovery first, then asking the ACP agent to infer a
+                        <code> VIBE.md</code> from the target URL when needed, forwarding the
+                        render job, and waiting for <code>index.html</code>.
                       </p>
                     </div>
                   </div>
@@ -783,10 +793,11 @@ function App() {
                       <div class="eyebrow">MVP Flow</div>
                       <h1>Visit a site and let the agent render it.</h1>
                       <p>
-                        The browser runs Vibe discovery first, embeds the protocol spec plus the
-                        discovered <code>VIBE.md</code> into an ACP prompt, and expects the agent
-                        to write a renderable <code>index.html</code> into the Vibe cache
-                        directory.
+                        The browser runs Vibe discovery first, and if the site does not publish
+                        <code> VIBE.md</code> it asks the ACP agent to infer one from the target
+                        URL before embedding the protocol spec plus that request into an ACP
+                        prompt. The agent is then expected to write a renderable
+                        <code> index.html</code> into the Vibe cache directory.
                       </p>
 
                       <div class="settings-actions">
@@ -821,7 +832,8 @@ function App() {
                         <div>
                           <span>Discovery</span>
                           <strong>
-                            <code>/.well-known/VIBE.md</code> then <code>/VIBE.md</code>
+                            <code>/.well-known/VIBE.md</code>, then <code>/VIBE.md</code>, then
+                            ask ACP agent to infer from URL
                           </strong>
                         </div>
                         <div>
@@ -898,6 +910,14 @@ function App() {
                     <div class="inspector-card">
                       <div class="eyebrow">Discovery</div>
                       <h3>Attempted locations</h3>
+                      <p>
+                        Source:{" "}
+                        <strong>
+                          {navigation().vibe_source === "inferred"
+                            ? "Agent-inferred from URL"
+                            : "Published VIBE.md"}
+                        </strong>
+                      </p>
                       <ul class="compact-list">
                         <For each={navigation().discovery_attempts}>
                           {(attempt) => (
@@ -968,8 +988,12 @@ function App() {
                     </div>
 
                     <div class="inspector-card">
-                      <div class="eyebrow">VIBE.md</div>
-                      <h3>Discovered source</h3>
+                      <div class="eyebrow">Vibe Document</div>
+                      <h3>
+                        {navigation().vibe_source === "inferred"
+                          ? "Inferred VIBE.md"
+                          : "Published VIBE.md"}
+                      </h3>
                       <pre class="markdown-block">{navigation().vibe_markdown}</pre>
                     </div>
                   </>

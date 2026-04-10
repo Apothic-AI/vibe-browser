@@ -100,6 +100,7 @@ pub struct VibeNavigationResult {
     pub source_url: String,
     pub normalized_url: String,
     pub discovered_url: String,
+    pub vibe_source: VibeDocumentSource,
     pub vibe_markdown: String,
     pub discovery_attempts: Vec<DiscoveryAttempt>,
     pub render_dir: String,
@@ -115,10 +116,18 @@ pub struct VibeNavigationResult {
     pub model_selector: Option<AcpModelSelector>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VibeDocumentSource {
+    Published,
+    Inferred,
+}
+
 #[derive(Debug)]
 struct DiscoveredVibeDocument {
     normalized_url: String,
     discovered_url: String,
+    source: VibeDocumentSource,
     vibe_markdown: String,
     attempts: Vec<DiscoveryAttempt>,
 }
@@ -128,6 +137,7 @@ struct RenderSession {
     root_dir: PathBuf,
     context_dir: PathBuf,
     index_path: PathBuf,
+    vibe_path: PathBuf,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -600,11 +610,31 @@ async fn visit_vibe_url_inner(
         Some(final_message)
     };
 
+    let vibe_markdown = match discovered.source {
+        VibeDocumentSource::Published => discovered.vibe_markdown.clone(),
+        VibeDocumentSource::Inferred => {
+            match tokio::fs::read_to_string(&render_session.vibe_path).await {
+                Ok(vibe_markdown) => vibe_markdown,
+                Err(_) => {
+                    agent_run.logs.push(AgentLogEntry {
+                    kind: "warning".to_string(),
+                    message: format!(
+                        "The agent did not write an inferred VIBE.md at {}. Showing the browser fallback instructions instead.",
+                        render_session.vibe_path.display()
+                    ),
+                });
+                    discovered.vibe_markdown.clone()
+                }
+            }
+        }
+    };
+
     Ok(VibeNavigationResult {
         source_url: url_input.trim().to_string(),
         normalized_url: discovered.normalized_url,
         discovered_url: discovered.discovered_url,
-        vibe_markdown: discovered.vibe_markdown,
+        vibe_source: discovered.source,
+        vibe_markdown,
         discovery_attempts: discovered.attempts,
         render_dir: render_session.root_dir.display().to_string(),
         index_path: render_session.index_path.display().to_string(),
@@ -731,6 +761,7 @@ async fn discover_vibe_document(url_input: &str) -> Result<DiscoveredVibeDocumen
                     return Ok(DiscoveredVibeDocument {
                         normalized_url: normalized.to_string(),
                         discovered_url: candidate.to_string(),
+                        source: VibeDocumentSource::Published,
                         vibe_markdown: body,
                         attempts,
                     });
@@ -754,14 +785,7 @@ async fn discover_vibe_document(url_input: &str) -> Result<DiscoveredVibeDocumen
         }
     }
 
-    Err(anyhow!(
-        "Unable to discover VIBE.md. Tried: {}",
-        attempts
-            .iter()
-            .map(|attempt| attempt.url.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
+    Ok(build_agent_inference_document(&normalized, attempts)?)
 }
 
 fn normalize_input_url(url_input: &str) -> Result<Url> {
@@ -816,6 +840,57 @@ fn build_discovery_candidates(url: &Url) -> Result<Vec<Url>> {
     Ok(candidates)
 }
 
+fn build_inference_target(url: &Url) -> Result<Url> {
+    if !(url.path().ends_with("/VIBE.md") || url.path().ends_with("VIBE.md")) {
+        return Ok(url.clone());
+    }
+
+    let mut target = url.clone();
+    target.set_query(None);
+    target.set_fragment(None);
+
+    let next_path = match target.path() {
+        "/VIBE.md" | "/.well-known/VIBE.md" => "/".to_string(),
+        path => {
+            let trimmed = path.trim_end_matches('/');
+            if let Some((parent, _)) = trimmed.rsplit_once('/') {
+                if parent.is_empty() {
+                    "/".to_string()
+                } else {
+                    parent.to_string()
+                }
+            } else {
+                "/".to_string()
+            }
+        }
+    };
+
+    target.set_path(&next_path);
+    Ok(target)
+}
+
+fn build_agent_inference_document(
+    normalized: &Url,
+    mut attempts: Vec<DiscoveryAttempt>,
+) -> Result<DiscoveredVibeDocument> {
+    let inference_url = build_inference_target(normalized)?;
+    attempts.push(DiscoveryAttempt {
+        url: inference_url.to_string(),
+        ok: true,
+        status_code: None,
+        detail: "No published VIBE.md was found. The ACP agent must infer one from this URL."
+            .to_string(),
+    });
+
+    Ok(DiscoveredVibeDocument {
+        normalized_url: normalized.to_string(),
+        discovered_url: inference_url.to_string(),
+        source: VibeDocumentSource::Inferred,
+        vibe_markdown: build_inference_request_markdown(&inference_url, &attempts),
+        attempts,
+    })
+}
+
 async fn prepare_render_session(
     data_dir: &Path,
     discovered: &DiscoveredVibeDocument,
@@ -825,6 +900,8 @@ async fn prepare_render_session(
         .join("vibe-renders")
         .join(uuid::Uuid::new_v4().to_string());
     let context_dir = root_dir.join("_context");
+    let index_path = root_dir.join("index.html");
+    let vibe_path = root_dir.join("VIBE.md");
     tokio::fs::create_dir_all(&context_dir)
         .await
         .context("failed to create Vibe render cache directory")?;
@@ -834,16 +911,19 @@ async fn prepare_render_session(
         &RenderSession {
             root_dir: root_dir.clone(),
             context_dir: context_dir.clone(),
-            index_path: root_dir.join("index.html"),
+            index_path: index_path.clone(),
+            vibe_path: vibe_path.clone(),
         },
         agent_settings,
     );
 
-    tokio::fs::write(
-        context_dir.join("VIBE.md"),
-        discovered.vibe_markdown.as_bytes(),
-    )
-    .await?;
+    if discovered.source == VibeDocumentSource::Published {
+        tokio::fs::write(
+            context_dir.join("VIBE.md"),
+            discovered.vibe_markdown.as_bytes(),
+        )
+        .await?;
+    }
     tokio::fs::write(
         context_dir.join("VIBE-PROTOCOL-SPEC.md"),
         VIBE_SPEC_MARKDOWN.as_bytes(),
@@ -862,9 +942,10 @@ async fn prepare_render_session(
     .await?;
 
     Ok(RenderSession {
-        root_dir: root_dir.clone(),
+        root_dir,
         context_dir,
-        index_path: root_dir.join("index.html"),
+        index_path,
+        vibe_path,
     })
 }
 
@@ -875,12 +956,15 @@ fn build_vibe_prompt(
 ) -> String {
     let user_instructions_section =
         format_user_instructions_section(agent_settings.my_vibes.as_deref());
+    let source_specific_section = format_source_specific_section(discovered, render_session);
+    let available_context_section = format_available_context_section(discovered, render_session);
+    let vibe_document_section = format_vibe_document_section(discovered);
     format!(
         r#"# Vibe Browser Rendering Job
 
 You are the rendering agent inside Vibe Browser.
-
-Your job is to convert the discovered VIBE.md into a concrete page that this browser can render.
+ 
+Your job is to create a concrete page that this browser can render.
 
 ## Required Output Contract
 
@@ -893,21 +977,25 @@ Your job is to convert the discovered VIBE.md into a concrete page that this bro
 5. Make `index.html` self-contained with inline CSS and inline JS whenever possible.
    The browser renders `index.html` directly, so it must work without depending on extra files.
 6. You MAY still create additional files for documentation, alternate views, extracted styles, or future use.
-7. If the VIBE.md references integrations or endpoints that you do not support, ignore them gracefully and keep rendering the best page you can from the published instructions.
-8. When you are done, send a short final assistant message that starts with `RENDER_READY:` and names the main file path.
+7. If the site does not publish a VIBE.md, you MUST infer one yourself and save it at this exact absolute path:
+   `{vibe_path}`
+8. If the site already publishes a VIBE.md, you MAY still write an updated working copy into `{vibe_path}`, but do not overwrite the meaning of the published one unless you are clearly extending it for rendering purposes.
+9. If the VIBE document or the live site references integrations or endpoints that you do not support, ignore them gracefully and keep rendering the best page you can from the available instructions.
+10. When you are done, send a short final assistant message that starts with `RENDER_READY:` and names the main file path.
 
 ## Available Context Files
 
-- Discovered VIBE.md copy: `{context_vibe}`
-- Embedded spec copy: `{context_spec}`
+{available_context_section}
 - This prompt: `{context_prompt}`
 
-## Target URL
+## Vibe Document Source
 
 - User requested URL: `{requested_url}`
-- Discovered VIBE.md URL: `{discovered_url}`
+- Vibe document source: `{vibe_source}`
+- Vibe document URL: `{discovered_url}`
 
 {user_instructions_section}
+{source_specific_section}
 
 ## Vibe Protocol Spec
 
@@ -915,25 +1003,23 @@ Your job is to convert the discovered VIBE.md into a concrete page that this bro
 {vibe_spec}
 ````
 
-## Discovered VIBE.md
-
-````md
-{vibe_markdown}
-````
+{vibe_document_section}
 "#,
         index_path = render_session.index_path.display(),
         root_dir = render_session.root_dir.display(),
-        context_vibe = render_session.context_dir.join("VIBE.md").display(),
-        context_spec = render_session
-            .context_dir
-            .join("VIBE-PROTOCOL-SPEC.md")
-            .display(),
+        vibe_path = render_session.vibe_path.display(),
+        available_context_section = available_context_section,
         context_prompt = render_session.context_dir.join("PROMPT.md").display(),
         requested_url = discovered.normalized_url,
         discovered_url = discovered.discovered_url,
+        vibe_source = match discovered.source {
+            VibeDocumentSource::Published => "published",
+            VibeDocumentSource::Inferred => "inferred",
+        },
         user_instructions_section = user_instructions_section,
+        source_specific_section = source_specific_section,
         vibe_spec = VIBE_SPEC_MARKDOWN,
-        vibe_markdown = discovered.vibe_markdown,
+        vibe_document_section = vibe_document_section,
     )
 }
 
@@ -1197,6 +1283,7 @@ async fn probe_agent_model_selector(
                 root_dir: probe_root.clone(),
                 context_dir: probe_root.join("_context"),
                 index_path: probe_root.join("index.html"),
+                vibe_path: probe_root.join("VIBE.md"),
             };
             let mut command = build_agent_process(&agent_settings, &render_session)?;
             let mut child = command.spawn().with_context(|| {
@@ -1392,6 +1479,115 @@ Treat the User Instructions section below as higher priority than every other in
     )
 }
 
+fn format_available_context_section(
+    discovered: &DiscoveredVibeDocument,
+    render_session: &RenderSession,
+) -> String {
+    match discovered.source {
+        VibeDocumentSource::Published => format!(
+            "Published VIBE.md copy: `{}`\n- Embedded spec copy: `{}`",
+            render_session.context_dir.join("VIBE.md").display(),
+            render_session
+                .context_dir
+                .join("VIBE-PROTOCOL-SPEC.md")
+                .display()
+        ),
+        VibeDocumentSource::Inferred => format!(
+            "Embedded spec copy: `{}`\n- Discovery attempt log: `{}`",
+            render_session
+                .context_dir
+                .join("VIBE-PROTOCOL-SPEC.md")
+                .display(),
+            render_session
+                .context_dir
+                .join("discovery-attempts.json")
+                .display()
+        ),
+    }
+}
+
+fn format_source_specific_section(
+    discovered: &DiscoveredVibeDocument,
+    render_session: &RenderSession,
+) -> String {
+    match discovered.source {
+        VibeDocumentSource::Published => String::new(),
+        VibeDocumentSource::Inferred => format!(
+            r#"## Agent-Driven VIBE Inference
+
+The site did not publish a VIBE.md.
+
+You must inspect the live site at `{inference_url}`, infer a valid VIBE.md from that site yourself, save that inferred VIBE.md at `{vibe_path}`, and then render the site.
+
+Use the Vibe Protocol spec below to shape the inferred document. Do not ask the browser for heuristics or extracted site summaries, because none are being provided.
+
+"#,
+            inference_url = discovered.discovered_url,
+            vibe_path = render_session.vibe_path.display(),
+        ),
+    }
+}
+
+fn format_vibe_document_section(discovered: &DiscoveredVibeDocument) -> String {
+    match discovered.source {
+        VibeDocumentSource::Published => format!(
+            r#"## Published VIBE.md
+
+````md
+{vibe_markdown}
+````
+"#,
+            vibe_markdown = discovered.vibe_markdown
+        ),
+        VibeDocumentSource::Inferred => format!(
+            r#"## Inference Request
+
+````md
+{vibe_markdown}
+````
+"#,
+            vibe_markdown = discovered.vibe_markdown
+        ),
+    }
+}
+
+fn build_inference_request_markdown(url: &Url, attempts: &[DiscoveryAttempt]) -> String {
+    format!(
+        r#"# VIBE Inference Request
+
+No published `VIBE.md` was found for this navigation target.
+
+## Target
+
+URL: {url}
+
+## Agent Instructions
+
+Infer a valid `VIBE.md` for this site by inspecting the live URL directly.
+Use the Vibe Protocol spec to shape the file you create.
+Save the inferred `VIBE.md` into the render output directory before or while producing the rendered site files.
+
+## Discovery Attempts
+
+{attempts}
+"#,
+        url = url,
+        attempts = format_discovery_attempts(attempts),
+    )
+}
+
+fn format_discovery_attempts(attempts: &[DiscoveryAttempt]) -> String {
+    if attempts.is_empty() {
+        "- None".to_string()
+    } else {
+        attempts
+            .iter()
+            .map(|attempt| format!("- {} ({})", attempt.url, attempt.detail))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 fn slice_text_content(content: &str, line: Option<u32>, limit: Option<u32>) -> String {
     let lines = content.lines().collect::<Vec<_>>();
     let start = line.unwrap_or(1).saturating_sub(1) as usize;
@@ -1569,8 +1765,9 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let script_path = write_stub_agent_script(temp_dir.path())?;
         let python = find_python_command()?;
-        let server = start_test_vibe_server(
-            r#"# VIBE.md
+        let server = start_test_site(
+            Some(
+                r#"# VIBE.md
 
 ## Service
 
@@ -1580,6 +1777,8 @@ Name: Signal Garden
 
 Render a landing page for developers.
 "#,
+            ),
+            "<!doctype html><html><head><title>Signal Garden</title></head><body><h1>Signal Garden</h1></body></html>",
         )
         .await?;
 
@@ -1594,6 +1793,7 @@ Render a landing page for developers.
 
         assert_eq!(result.source_url, server.base_url);
         assert!(result.discovered_url.ends_with("/.well-known/VIBE.md"));
+        assert_eq!(result.vibe_source, VibeDocumentSource::Published);
         assert!(result.html.contains("Signal Garden"));
         assert!(result.html.contains("Rendered from VIBE.md"));
         assert!(!result.fallback_used);
@@ -1606,6 +1806,61 @@ Render a landing page for developers.
             "expected index.html to be written by the ACP agent"
         );
         assert!(Path::new(&result.index_path).exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn infers_vibe_document_when_site_has_no_published_vibe() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let script_path = write_stub_agent_script(temp_dir.path())?;
+        let python = find_python_command()?;
+        let server = start_test_site(
+            None,
+            r#"<!doctype html>
+<html>
+  <head>
+    <title>Acme Orbit | Autonomous logistics</title>
+    <meta name="description" content="Routing software for autonomous fleets." />
+  </head>
+  <body>
+    <main>
+      <h1>Acme Orbit</h1>
+      <h2>Routing for autonomous fleets</h2>
+      <p>Coordinate dispatch, telemetry, and route planning from one control surface.</p>
+    </main>
+  </body>
+</html>"#,
+        )
+        .await?;
+
+        let settings = VibeAgentSettings {
+            command: format!("{} {}", python, script_path.display()),
+            workdir: None,
+            my_vibes: None,
+        };
+
+        let result =
+            visit_vibe_url_inner(&server.base_url, None, &settings, temp_dir.path()).await?;
+
+        assert_eq!(result.vibe_source, VibeDocumentSource::Inferred);
+        assert!(result.discovered_url.starts_with(&server.base_url));
+        assert!(result.vibe_markdown.contains("# VIBE.md"));
+        assert!(result.vibe_markdown.contains("Name: Signal Garden"));
+        assert!(result
+            .discovery_attempts
+            .iter()
+            .any(|attempt| attempt.detail.contains("ACP agent must infer one")));
+        assert!(result.html.contains("Rendered from VIBE.md"));
+        assert!(Path::new(&result.render_dir).join("VIBE.md").exists());
+        assert!(!Path::new(&result.render_dir)
+            .join("_context")
+            .join("SOURCE-PAGE.html")
+            .exists());
+        assert!(!result
+            .discovery_attempts
+            .iter()
+            .any(|attempt| attempt.detail.contains("Fetched source page")));
 
         Ok(())
     }
@@ -1659,8 +1914,9 @@ Render a landing page for developers.
         }
 
         let temp_dir = TempDir::new()?;
-        let server = start_test_vibe_server(
-            r#"# VIBE.md
+        let server = start_test_site(
+            Some(
+                r#"# VIBE.md
 
 ## Service
 
@@ -1670,6 +1926,8 @@ Name: Signal Garden
 
 Create a self-contained HTML page that includes the exact text "Signal Garden" and the exact text "Rendered from VIBE.md".
 "#,
+            ),
+            "<!doctype html><html><head><title>Signal Garden</title></head><body><h1>Signal Garden</h1></body></html>",
         )
         .await?;
 
@@ -1695,10 +1953,14 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
         Ok(())
     }
 
-    async fn start_test_vibe_server(vibe_markdown: &str) -> Result<TestVibeServer> {
+    async fn start_test_site(
+        vibe_markdown: Option<&str>,
+        source_html: &str,
+    ) -> Result<TestVibeServer> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let body = vibe_markdown.to_string();
+        let vibe_markdown = vibe_markdown.map(str::to_string);
+        let source_html = source_html.to_string();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -1707,7 +1969,8 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
                     _ = &mut shutdown_rx => break,
                     accept_result = listener.accept() => {
                         let Ok((mut stream, _)) = accept_result else { break; };
-                        let body = body.clone();
+                        let vibe_markdown = vibe_markdown.clone();
+                        let source_html = source_html.clone();
                         tokio::spawn(async move {
                             let mut request_bytes = vec![0_u8; 4096];
                             let read = match stream.read(&mut request_bytes).await {
@@ -1725,14 +1988,20 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
                                 .and_then(|line| line.split_whitespace().nth(1))
                                 .unwrap_or("/");
 
-                            let (status, response_body) = if matches!(path, "/.well-known/VIBE.md" | "/VIBE.md") {
-                                ("200 OK", body)
+                            let (status, content_type, response_body) = if matches!(path, "/.well-known/VIBE.md" | "/VIBE.md") {
+                                if let Some(body) = vibe_markdown.clone() {
+                                    ("200 OK", "text/markdown; charset=utf-8", body)
+                                } else {
+                                    ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string())
+                                }
+                            } else if path == "/" {
+                                ("200 OK", "text/html; charset=utf-8", source_html.clone())
                             } else {
-                                ("404 Not Found", "not found".to_string())
+                                ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string())
                             };
 
                             let response = format!(
-                                "HTTP/1.1 {status}\r\nContent-Type: text/markdown; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 response_body.len(),
                                 response_body
                             );
@@ -1753,7 +2022,7 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
 
     fn write_stub_agent_script(base_dir: &Path) -> Result<PathBuf> {
         let script_path = base_dir.join("stub_acp_agent.py");
-        let script = r#"#!/usr/bin/env python3
+        let script = r##"#!/usr/bin/env python3
 import json
 import re
 import sys
@@ -1768,16 +2037,48 @@ def send(message):
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
 
-def extract_render_path(prompt_blocks):
-    prompt_text = "\n".join(
+def extract_prompt_text(prompt_blocks):
+    return "\n".join(
         block.get("text", "")
         for block in prompt_blocks
         if isinstance(block, dict) and block.get("type") == "text"
     )
-    match = re.search(r"exact absolute path:\s*`([^`]+)`", prompt_text, flags=re.IGNORECASE | re.DOTALL)
+
+def extract_render_path(prompt_text):
+    match = re.search(r"main page at this exact absolute path:\s*`([^`]+)`", prompt_text, flags=re.IGNORECASE | re.DOTALL)
     if not match:
         raise RuntimeError("render path not found in prompt")
     return match.group(1)
+
+def extract_inferred_vibe_path(prompt_text):
+    match = re.search(r"infer one yourself and save it at this exact absolute path:\s*`([^`]+)`", prompt_text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return match.group(1)
+
+def write_file(session_id, path, content, request_id):
+    send({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "fs/write_text_file",
+        "params": {
+            "sessionId": session_id,
+            "path": path,
+            "content": content
+        }
+    })
+
+    while True:
+        response = recv()
+        if response.get("id") == request_id:
+            return
+
+def inferred_vibe_document():
+    return "# VIBE.md\n\n## Service\n\nName: Signal Garden\n\n## Instructions\n\nRender a landing page for developers.\n"
+
+def prompt_requests_inference(prompt_text):
+    prompt_text = " ".join(line.strip() for line in prompt_text.splitlines())
+    return "The site did not publish a VIBE.md." in prompt_text
 
 while True:
     message = recv()
@@ -1813,25 +2114,18 @@ while True:
         continue
 
     if method == "session/prompt":
-        render_path = extract_render_path(params.get("prompt", []))
+        prompt_text = extract_prompt_text(params.get("prompt", []))
+        render_path = extract_render_path(prompt_text)
+        inferred_vibe_path = extract_inferred_vibe_path(prompt_text)
         html = "<!doctype html><html><body><main><h1>Signal Garden</h1><p>Rendered from VIBE.md</p></main></body></html>"
+        session_id = params.get("sessionId", "stub-session")
         file_request_id = 1001
 
-        send({
-            "jsonrpc": "2.0",
-            "id": file_request_id,
-            "method": "fs/write_text_file",
-            "params": {
-                "sessionId": params.get("sessionId", "stub-session"),
-                "path": render_path,
-                "content": html
-            }
-        })
+        if inferred_vibe_path and prompt_requests_inference(prompt_text):
+            write_file(session_id, inferred_vibe_path, inferred_vibe_document(), file_request_id)
+            file_request_id += 1
 
-        while True:
-            response = recv()
-            if response.get("id") == file_request_id:
-                break
+        write_file(session_id, render_path, html, file_request_id)
 
         send({
             "jsonrpc": "2.0",
@@ -1851,7 +2145,7 @@ while True:
                 "message": f"Method not found: {method}"
             }
         })
-"#;
+"##;
 
         fs::write(&script_path, script)?;
         Ok(script_path)
