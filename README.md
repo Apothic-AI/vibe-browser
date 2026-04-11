@@ -55,12 +55,15 @@ The browser lets you configure:
 
 - ACP agent command
 - optional ACP agent working directory
+- fallback `llms.txt` timeout, used only when no published `VIBE.md` exists
 - ACP model selection from the agent’s reported `configOptions`
 - `My Vibes`, a saved system-prompt-style instruction block that is injected into the ACP render prompt as `User Instructions`
 
 The selected ACP model is persisted, so the browser reuses it across renders and app restarts when that model is still available from the agent.
 
 `My Vibes` is also persisted. When present, the render prompt includes a dedicated `User Instructions` section that explicitly tells the ACP agent to treat those instructions as higher priority than the rest of the prompt, the embedded Vibe Protocol spec, and the discovered `VIBE.md`.
+
+When the site does not publish a `VIBE.md`, the browser also tries a short fetch of `/llms.txt`. If that companion text file is published and arrives within the configured timeout, the browser includes it in the ACP prompt as additional publisher-authored context for the inference/render step.
 
 You can set any shell command in the UI that starts the ACP process Vibe Browser should use.
 

@@ -13,6 +13,7 @@ interface VibeAgentSettings {
   command: string;
   workdir?: string | null;
   my_vibes?: string | null;
+  llms_txt_timeout_ms: number;
 }
 
 interface AcpModelOption {
@@ -172,6 +173,7 @@ function App() {
   const [settingsCommand, setSettingsCommand] = createSignal("");
   const [settingsWorkdir, setSettingsWorkdir] = createSignal("");
   const [settingsMyVibes, setSettingsMyVibes] = createSignal("");
+  const [settingsLlmsTxtTimeoutMs, setSettingsLlmsTxtTimeoutMs] = createSignal("250");
   const [modelSelector, setModelSelector] = createSignal<AcpModelSelector | null>(null);
   const [selectedModel, setSelectedModel] = createSignal("");
   const [modelsLoading, setModelsLoading] = createSignal(false);
@@ -271,6 +273,7 @@ function App() {
     setSettingsCommand(response.data.command);
     setSettingsWorkdir(response.data.workdir || "");
     setSettingsMyVibes(response.data.my_vibes || "");
+    setSettingsLlmsTxtTimeoutMs(String(response.data.llms_txt_timeout_ms));
   };
 
   const loadModelSelector = async () => {
@@ -450,6 +453,12 @@ function App() {
 
   const saveSettings = async () => {
     setError(null);
+    const parsedLlmsTxtTimeoutMs = Number(settingsLlmsTxtTimeoutMs().trim());
+
+    if (!Number.isInteger(parsedLlmsTxtTimeoutMs) || parsedLlmsTxtTimeoutMs <= 0) {
+      setError("llms.txt timeout must be a positive integer number of milliseconds.");
+      return;
+    }
 
     try {
       const response = await invoke<CommandResponse<VibeAgentSettings>>("set_vibe_agent_settings", {
@@ -457,6 +466,7 @@ function App() {
           command: settingsCommand().trim(),
           workdir: settingsWorkdir().trim() || null,
           my_vibes: settingsMyVibes().trim() || null,
+          llms_txt_timeout_ms: parsedLlmsTxtTimeoutMs,
         },
       });
 
@@ -572,6 +582,23 @@ function App() {
             />
             <small class="settings-help">
               Leave blank unless the ACP command expects to start from a specific directory.
+            </small>
+          </label>
+
+          <label class="settings-field">
+            <span>Fallback llms.txt timeout (ms)</span>
+            <input
+              type="number"
+              min="1"
+              step="50"
+              value={settingsLlmsTxtTimeoutMs()}
+              onInput={(event) => setSettingsLlmsTxtTimeoutMs(event.currentTarget.value)}
+              placeholder="250"
+            />
+            <small class="settings-help">
+              Only used when a site does not publish <code>VIBE.md</code>. The browser will try
+              fetching <code>/llms.txt</code> with this timeout and include it in the ACP prompt if
+              it arrives in time.
             </small>
           </label>
 
@@ -874,6 +901,14 @@ function App() {
                   <div>
                     <dt>Selected model</dt>
                     <dd>{currentModelLabel()}</dd>
+                  </div>
+                  <div>
+                    <dt>Fallback llms.txt timeout</dt>
+                    <dd>
+                      {(activeTab()?.result?.agent_settings.llms_txt_timeout_ms ||
+                        agentSettings()?.llms_txt_timeout_ms ||
+                        250) + " ms"}
+                    </dd>
                   </div>
                   <div>
                     <dt>Render directory</dt>

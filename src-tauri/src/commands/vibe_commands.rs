@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::State;
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -16,7 +17,9 @@ const VIBE_AGENT_COMMAND_KEY: &str = "vibe_agent_command";
 const VIBE_AGENT_WORKDIR_KEY: &str = "vibe_agent_workdir";
 const VIBE_AGENT_MODEL_KEY: &str = "vibe_agent_model";
 const VIBE_AGENT_MY_VIBES_KEY: &str = "vibe_agent_my_vibes";
+const VIBE_AGENT_LLMS_TXT_TIMEOUT_MS_KEY: &str = "vibe_agent_llms_txt_timeout_ms";
 const DEFAULT_RECOMMENDED_MODEL: &str = "openrouter/inception/mercury-2";
+const DEFAULT_LLMS_TXT_TIMEOUT_MS: u64 = 250;
 // Keep a local copy of the protocol spec so the standalone repo builds outside the monorepo.
 const VIBE_SPEC_MARKDOWN: &str = include_str!("../../VIBE-PROTOCOL-SPEC.md");
 
@@ -40,6 +43,7 @@ pub struct VibeAgentSettings {
     pub command: String,
     pub workdir: Option<String>,
     pub my_vibes: Option<String>,
+    pub llms_txt_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +134,14 @@ struct DiscoveredVibeDocument {
     discovered_url: String,
     source: VibeDocumentSource,
     vibe_markdown: String,
+    llms_txt: Option<LlmsTextDocument>,
     attempts: Vec<DiscoveryAttempt>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmsTextDocument {
+    url: String,
+    content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +485,12 @@ pub async fn set_vibe_agent_settings(
         ));
     }
 
+    if settings.llms_txt_timeout_ms == 0 {
+        return Ok(CommandResponse::error(
+            "llms.txt timeout must be greater than 0 milliseconds.".to_string(),
+        ));
+    }
+
     state
         .config_manager
         .set_config_value(VIBE_AGENT_COMMAND_KEY, settings.command.trim())
@@ -521,6 +538,13 @@ pub async fn set_vibe_agent_settings(
                 .await;
         }
     }
+
+    let llms_txt_timeout_ms = settings.llms_txt_timeout_ms.to_string();
+    state
+        .config_manager
+        .set_config_value(VIBE_AGENT_LLMS_TXT_TIMEOUT_MS_KEY, &llms_txt_timeout_ms)
+        .await
+        .map_err(|err| err.to_string())?;
 
     resolve_agent_settings(&state.config_manager)
         .await
@@ -571,7 +595,11 @@ async fn visit_vibe_url_inner(
     agent_settings: &VibeAgentSettings,
     data_dir: &Path,
 ) -> Result<VibeNavigationResult> {
-    let discovered = discover_vibe_document(url_input).await?;
+    let discovered = discover_vibe_document(
+        url_input,
+        Duration::from_millis(agent_settings.llms_txt_timeout_ms),
+    )
+    .await?;
     let render_session = prepare_render_session(data_dir, &discovered, agent_settings).await?;
     let prompt = build_vibe_prompt(&discovered, &render_session, agent_settings);
     let mut agent_run =
@@ -701,6 +729,12 @@ async fn resolve_agent_settings(config_manager: &ConfigManager) -> Result<VibeAg
         command,
         workdir,
         my_vibes,
+        llms_txt_timeout_ms: config_manager
+            .get_config_value(VIBE_AGENT_LLMS_TXT_TIMEOUT_MS_KEY)
+            .await?
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_LLMS_TXT_TIMEOUT_MS),
     })
 }
 
@@ -749,7 +783,10 @@ fn default_agent_workdir() -> Option<String> {
     None
 }
 
-async fn discover_vibe_document(url_input: &str) -> Result<DiscoveredVibeDocument> {
+async fn discover_vibe_document(
+    url_input: &str,
+    llms_txt_timeout: Duration,
+) -> Result<DiscoveredVibeDocument> {
     let normalized = normalize_input_url(url_input)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -779,6 +816,7 @@ async fn discover_vibe_document(url_input: &str) -> Result<DiscoveredVibeDocumen
                         discovered_url: candidate.to_string(),
                         source: VibeDocumentSource::Published,
                         vibe_markdown: body,
+                        llms_txt: None,
                         attempts,
                     });
                 }
@@ -801,7 +839,14 @@ async fn discover_vibe_document(url_input: &str) -> Result<DiscoveredVibeDocumen
         }
     }
 
-    Ok(build_agent_inference_document(&normalized, attempts)?)
+    let llms_txt =
+        fetch_optional_llms_txt(&client, &normalized, llms_txt_timeout, &mut attempts).await?;
+
+    Ok(build_agent_inference_document(
+        &normalized,
+        attempts,
+        llms_txt,
+    )?)
 }
 
 fn normalize_input_url(url_input: &str) -> Result<Url> {
@@ -885,9 +930,76 @@ fn build_inference_target(url: &Url) -> Result<Url> {
     Ok(target)
 }
 
+fn build_llms_txt_candidate(url: &Url) -> Result<Url> {
+    let mut candidate = url.clone();
+    candidate.set_path("/llms.txt");
+    candidate.set_query(None);
+    candidate.set_fragment(None);
+    Ok(candidate)
+}
+
+async fn fetch_optional_llms_txt(
+    client: &reqwest::Client,
+    normalized: &Url,
+    timeout: Duration,
+    attempts: &mut Vec<DiscoveryAttempt>,
+) -> Result<Option<LlmsTextDocument>> {
+    let candidate = build_llms_txt_candidate(normalized)?;
+    let response = client.get(candidate.as_str()).timeout(timeout).send().await;
+
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .context("failed to read discovered llms.txt")?;
+                attempts.push(DiscoveryAttempt {
+                    url: candidate.to_string(),
+                    ok: true,
+                    status_code: Some(status.as_u16()),
+                    detail: "Fetched llms.txt companion".to_string(),
+                });
+
+                Ok(Some(LlmsTextDocument {
+                    url: candidate.to_string(),
+                    content: body,
+                }))
+            } else {
+                attempts.push(DiscoveryAttempt {
+                    url: candidate.to_string(),
+                    ok: false,
+                    status_code: Some(status.as_u16()),
+                    detail: format!("HTTP {}", status.as_u16()),
+                });
+                Ok(None)
+            }
+        }
+        Err(err) => {
+            let detail = if err.is_timeout() {
+                format!(
+                    "Timed out after {} ms while fetching llms.txt",
+                    timeout.as_millis()
+                )
+            } else {
+                err.to_string()
+            };
+            attempts.push(DiscoveryAttempt {
+                url: candidate.to_string(),
+                ok: false,
+                status_code: None,
+                detail,
+            });
+            Ok(None)
+        }
+    }
+}
+
 fn build_agent_inference_document(
     normalized: &Url,
     mut attempts: Vec<DiscoveryAttempt>,
+    llms_txt: Option<LlmsTextDocument>,
 ) -> Result<DiscoveredVibeDocument> {
     let inference_url = build_inference_target(normalized)?;
     attempts.push(DiscoveryAttempt {
@@ -903,6 +1015,7 @@ fn build_agent_inference_document(
         discovered_url: inference_url.to_string(),
         source: VibeDocumentSource::Inferred,
         vibe_markdown: build_inference_request_markdown(&inference_url, &attempts),
+        llms_txt,
         attempts,
     })
 }
@@ -940,6 +1053,9 @@ async fn prepare_render_session(
         )
         .await?;
     }
+    if let Some(llms_txt) = &discovered.llms_txt {
+        tokio::fs::write(context_dir.join("llms.txt"), llms_txt.content.as_bytes()).await?;
+    }
     tokio::fs::write(
         context_dir.join("VIBE-PROTOCOL-SPEC.md"),
         VIBE_SPEC_MARKDOWN.as_bytes(),
@@ -975,6 +1091,7 @@ fn build_vibe_prompt(
     let source_specific_section = format_source_specific_section(discovered, render_session);
     let available_context_section = format_available_context_section(discovered, render_session);
     let vibe_document_section = format_vibe_document_section(discovered);
+    let llms_txt_section = format_llms_txt_section(discovered);
     format!(
         r#"# Vibe Browser Rendering Job
 
@@ -1024,6 +1141,7 @@ Your job is to create a concrete page that this browser can render.
 ````
 
 {vibe_document_section}
+{llms_txt_section}
 "#,
         index_path = render_session.index_path.display(),
         root_dir = render_session.root_dir.display(),
@@ -1040,6 +1158,7 @@ Your job is to create a concrete page that this browser can render.
         source_specific_section = source_specific_section,
         vibe_spec = VIBE_SPEC_MARKDOWN,
         vibe_document_section = vibe_document_section,
+        llms_txt_section = llms_txt_section,
     )
 }
 
@@ -1512,17 +1631,33 @@ fn format_available_context_section(
                 .join("VIBE-PROTOCOL-SPEC.md")
                 .display()
         ),
-        VibeDocumentSource::Inferred => format!(
-            "Embedded spec copy: `{}`\n- Discovery attempt log: `{}`",
-            render_session
-                .context_dir
-                .join("VIBE-PROTOCOL-SPEC.md")
-                .display(),
-            render_session
-                .context_dir
-                .join("discovery-attempts.json")
-                .display()
-        ),
+        VibeDocumentSource::Inferred => {
+            let mut lines = vec![
+                format!(
+                    "Embedded spec copy: `{}`",
+                    render_session
+                        .context_dir
+                        .join("VIBE-PROTOCOL-SPEC.md")
+                        .display()
+                ),
+                format!(
+                    "- Discovery attempt log: `{}`",
+                    render_session
+                        .context_dir
+                        .join("discovery-attempts.json")
+                        .display()
+                ),
+            ];
+
+            if discovered.llms_txt.is_some() {
+                lines.push(format!(
+                    "- Published llms.txt copy: `{}`",
+                    render_session.context_dir.join("llms.txt").display()
+                ));
+            }
+
+            lines.join("\n")
+        }
     }
 }
 
@@ -1532,8 +1667,19 @@ fn format_source_specific_section(
 ) -> String {
     match discovered.source {
         VibeDocumentSource::Published => String::new(),
-        VibeDocumentSource::Inferred => format!(
-            r#"## Agent-Driven VIBE Inference
+        VibeDocumentSource::Inferred => {
+            let llms_note = if let Some(llms_txt) = &discovered.llms_txt {
+                format!(
+                    "A publisher-authored `llms.txt` was fetched from `{}` and copied to `{}`.\nUse it as additional publisher-authored context while inferring the `VIBE.md` and rendering the site, but do not treat it as a replacement for the `VIBE.md` you must write.\n\n",
+                    llms_txt.url,
+                    render_session.context_dir.join("llms.txt").display(),
+                )
+            } else {
+                String::new()
+            };
+
+            format!(
+                r#"## Agent-Driven VIBE Inference
 
 The site did not publish a VIBE.md.
 
@@ -1541,11 +1687,34 @@ You must inspect the live site at `{inference_url}`, infer a valid VIBE.md from 
 
 Use the Vibe Protocol spec below to shape the inferred document. Do not ask the browser for heuristics or extracted site summaries, because none are being provided.
 
-"#,
-            inference_url = discovered.discovered_url,
-            vibe_path = render_session.vibe_path.display(),
-        ),
+{llms_note}"#,
+                inference_url = discovered.discovered_url,
+                vibe_path = render_session.vibe_path.display(),
+                llms_note = llms_note,
+            )
+        }
     }
+}
+
+fn format_llms_txt_section(discovered: &DiscoveredVibeDocument) -> String {
+    let Some(llms_txt) = &discovered.llms_txt else {
+        return String::new();
+    };
+
+    format!(
+        r#"## Published llms.txt
+
+- URL: `{url}`
+
+Use the published `llms.txt` companion as additional publisher-authored context when inferring the VIBE document and rendering the site.
+
+````text
+{content}
+````
+"#,
+        url = llms_txt.url,
+        content = llms_txt.content,
+    )
 }
 
 fn format_vibe_document_section(discovered: &DiscoveredVibeDocument) -> String {
@@ -1826,6 +1995,8 @@ Render a landing page for developers.
 "#,
             ),
             "<!doctype html><html><head><title>Signal Garden</title></head><body><h1>Signal Garden</h1></body></html>",
+            None,
+            None,
         )
         .await?;
 
@@ -1833,6 +2004,7 @@ Render a landing page for developers.
             command: format!("{} {}", python, script_path.display()),
             workdir: None,
             my_vibes: None,
+            llms_txt_timeout_ms: DEFAULT_LLMS_TXT_TIMEOUT_MS,
         };
 
         let result =
@@ -1878,6 +2050,8 @@ Render a landing page for developers.
     </main>
   </body>
 </html>"#,
+            None,
+            None,
         )
         .await?;
 
@@ -1885,6 +2059,7 @@ Render a landing page for developers.
             command: format!("{} {}", python, script_path.display()),
             workdir: None,
             my_vibes: None,
+            llms_txt_timeout_ms: DEFAULT_LLMS_TXT_TIMEOUT_MS,
         };
 
         let result =
@@ -1904,10 +2079,131 @@ Render a landing page for developers.
             .join("_context")
             .join("SOURCE-PAGE.html")
             .exists());
+        assert!(!Path::new(&result.render_dir)
+            .join("_context")
+            .join("llms.txt")
+            .exists());
         assert!(!result
             .discovery_attempts
             .iter()
             .any(|attempt| attempt.detail.contains("Fetched source page")));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_fetches_llms_txt_and_includes_it_in_acp_prompt() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let script_path = write_stub_agent_script(temp_dir.path())?;
+        let python = find_python_command()?;
+        let server = start_test_site(
+            None,
+            r#"<!doctype html>
+<html>
+  <head>
+    <title>Docs Garden</title>
+  </head>
+  <body>
+    <main>
+      <h1>Docs Garden</h1>
+      <p>Publisher authored docs live here.</p>
+    </main>
+  </body>
+</html>"#,
+            Some(
+                r#"# Docs Garden
+
+> Publisher-authored text index for LLM clients.
+
+## Canonical Docs
+
+- [Getting Started](https://example.com/docs/getting-started.md)
+- [API Notes](https://example.com/docs/api.md)
+"#,
+            ),
+            None,
+        )
+        .await?;
+
+        let settings = VibeAgentSettings {
+            command: format!("{} {}", python, script_path.display()),
+            workdir: None,
+            my_vibes: None,
+            llms_txt_timeout_ms: DEFAULT_LLMS_TXT_TIMEOUT_MS,
+        };
+
+        let result =
+            visit_vibe_url_inner(&server.base_url, None, &settings, temp_dir.path()).await?;
+
+        let context_dir = Path::new(&result.render_dir).join("_context");
+        let llms_path = context_dir.join("llms.txt");
+        let prompt_path = context_dir.join("PROMPT.md");
+        let llms_text = fs::read_to_string(&llms_path)?;
+        let prompt_text = fs::read_to_string(&prompt_path)?;
+
+        assert_eq!(result.vibe_source, VibeDocumentSource::Inferred);
+        assert!(llms_path.exists());
+        assert!(llms_text.contains("Publisher-authored text index"));
+        assert!(prompt_text.contains("## Published llms.txt"));
+        assert!(prompt_text.contains("Use the published `llms.txt` companion"));
+        assert!(prompt_text.contains("Publisher-authored text index"));
+        assert!(result
+            .discovery_attempts
+            .iter()
+            .any(|attempt| attempt.url.ends_with("/llms.txt") && attempt.ok));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_llms_txt_respects_configured_timeout() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let script_path = write_stub_agent_script(temp_dir.path())?;
+        let python = find_python_command()?;
+        let server = start_test_site(
+            None,
+            r#"<!doctype html>
+<html>
+  <head>
+    <title>Slow Docs Garden</title>
+  </head>
+  <body>
+    <main>
+      <h1>Slow Docs Garden</h1>
+      <p>Slow companion text index.</p>
+    </main>
+  </body>
+</html>"#,
+            Some(
+                r#"# Slow Docs Garden
+
+- This llms.txt should arrive too late for the configured timeout.
+"#,
+            ),
+            Some(400),
+        )
+        .await?;
+
+        let settings = VibeAgentSettings {
+            command: format!("{} {}", python, script_path.display()),
+            workdir: None,
+            my_vibes: None,
+            llms_txt_timeout_ms: 100,
+        };
+
+        let result =
+            visit_vibe_url_inner(&server.base_url, None, &settings, temp_dir.path()).await?;
+
+        let context_dir = Path::new(&result.render_dir).join("_context");
+
+        assert_eq!(result.vibe_source, VibeDocumentSource::Inferred);
+        assert!(!context_dir.join("llms.txt").exists());
+        assert!(result.discovery_attempts.iter().any(|attempt| {
+            attempt.url.ends_with("/llms.txt")
+                && attempt
+                    .detail
+                    .contains("Timed out after 100 ms while fetching llms.txt")
+        }));
 
         Ok(())
     }
@@ -2004,6 +2300,7 @@ Render a landing page for developers.
             vibe_markdown:
                 "# Example\n\n## Service\n\n- Name: Example\n\n## Instructions\n\n- Render it.\n"
                     .to_string(),
+            llms_txt: None,
             attempts: Vec::new(),
         };
         let render_session = RenderSession {
@@ -2016,6 +2313,7 @@ Render a landing page for developers.
             command: "opencode acp".to_string(),
             workdir: None,
             my_vibes: None,
+            llms_txt_timeout_ms: DEFAULT_LLMS_TXT_TIMEOUT_MS,
         };
 
         let prompt = build_vibe_prompt(&discovered, &render_session, &settings);
@@ -2073,6 +2371,8 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
 "#,
             ),
             "<!doctype html><html><head><title>Signal Garden</title></head><body><h1>Signal Garden</h1></body></html>",
+            None,
+            None,
         )
         .await?;
 
@@ -2080,6 +2380,7 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
             command: "opencode acp".to_string(),
             workdir: None,
             my_vibes: None,
+            llms_txt_timeout_ms: DEFAULT_LLMS_TXT_TIMEOUT_MS,
         };
 
         let result =
@@ -2101,11 +2402,15 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
     async fn start_test_site(
         vibe_markdown: Option<&str>,
         source_html: &str,
+        llms_txt: Option<&str>,
+        llms_txt_delay_ms: Option<u64>,
     ) -> Result<TestVibeServer> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let vibe_markdown = vibe_markdown.map(str::to_string);
         let source_html = source_html.to_string();
+        let llms_txt = llms_txt.map(str::to_string);
+        let llms_txt_delay_ms = llms_txt_delay_ms.unwrap_or(0);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -2116,6 +2421,8 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
                         let Ok((mut stream, _)) = accept_result else { break; };
                         let vibe_markdown = vibe_markdown.clone();
                         let source_html = source_html.clone();
+                        let llms_txt = llms_txt.clone();
+                        let llms_txt_delay_ms = llms_txt_delay_ms;
                         tokio::spawn(async move {
                             let mut request_bytes = vec![0_u8; 4096];
                             let read = match stream.read(&mut request_bytes).await {
@@ -2136,6 +2443,15 @@ Create a self-contained HTML page that includes the exact text "Signal Garden" a
                             let (status, content_type, response_body) = if matches!(path, "/.well-known/VIBE.md" | "/VIBE.md") {
                                 if let Some(body) = vibe_markdown.clone() {
                                     ("200 OK", "text/markdown; charset=utf-8", body)
+                                } else {
+                                    ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string())
+                                }
+                            } else if path == "/llms.txt" {
+                                if llms_txt_delay_ms > 0 {
+                                    tokio::time::sleep(Duration::from_millis(llms_txt_delay_ms)).await;
+                                }
+                                if let Some(body) = llms_txt.clone() {
+                                    ("200 OK", "text/plain; charset=utf-8", body)
                                 } else {
                                     ("404 Not Found", "text/plain; charset=utf-8", "not found".to_string())
                                 }
