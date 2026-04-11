@@ -16,6 +16,7 @@ const VIBE_AGENT_COMMAND_KEY: &str = "vibe_agent_command";
 const VIBE_AGENT_WORKDIR_KEY: &str = "vibe_agent_workdir";
 const VIBE_AGENT_MODEL_KEY: &str = "vibe_agent_model";
 const VIBE_AGENT_MY_VIBES_KEY: &str = "vibe_agent_my_vibes";
+const DEFAULT_RECOMMENDED_MODEL: &str = "openrouter/inception/mercury-2";
 // Keep a local copy of the protocol spec so the standalone repo builds outside the monorepo.
 const VIBE_SPEC_MARKDOWN: &str = include_str!("../../VIBE-PROTOCOL-SPEC.md");
 
@@ -431,10 +432,17 @@ pub async fn get_vibe_agent_model_selector(
         .await
         .map_err(|err| err.to_string())?;
 
-    probe_agent_model_selector(&agent_settings, &state.data_dir, preferred_model.as_deref())
-        .await
-        .map(CommandResponse::success)
-        .map_err(|err| err.to_string())
+    let selector =
+        probe_agent_model_selector(&agent_settings, &state.data_dir, preferred_model.as_deref())
+            .await
+            .map_err(|err| err.to_string())?;
+    let selector = if preferred_model.is_none() {
+        apply_default_recommended_model(selector)
+    } else {
+        selector
+    };
+
+    Ok(CommandResponse::success(selector))
 }
 
 #[tauri::command]
@@ -1727,6 +1735,20 @@ fn apply_preferred_model_to_selector(
     }
 }
 
+fn apply_default_recommended_model(selector: Option<AcpModelSelector>) -> Option<AcpModelSelector> {
+    let mut selector = selector?;
+
+    if selector
+        .options
+        .iter()
+        .any(|option| option.value == DEFAULT_RECOMMENDED_MODEL)
+    {
+        selector.current_value = DEFAULT_RECOMMENDED_MODEL.to_string();
+    }
+
+    Some(selector)
+}
+
 fn collect_render_output_files(root_dir: &Path) -> Result<Vec<GeneratedFile>> {
     fn walk(base: &Path, current: &Path, files: &mut Vec<GeneratedFile>) -> Result<()> {
         for entry in std::fs::read_dir(current)? {
@@ -1914,6 +1936,53 @@ Render a landing page for developers.
         assert_eq!(
             selector.as_ref().map(|value| value.current_value.as_str()),
             Some("openai/gpt-5.4/high")
+        );
+    }
+
+    #[test]
+    fn recommended_model_becomes_default_when_available() {
+        let selector = Some(AcpModelSelector {
+            config_id: "model".to_string(),
+            current_value: "openai/gpt-5.4".to_string(),
+            options: vec![
+                AcpModelOption {
+                    value: "openai/gpt-5.4".to_string(),
+                    name: "GPT-5.4".to_string(),
+                    description: None,
+                },
+                AcpModelOption {
+                    value: DEFAULT_RECOMMENDED_MODEL.to_string(),
+                    name: "OpenRouter/Mercury 2".to_string(),
+                    description: None,
+                },
+            ],
+        });
+
+        let selector = apply_default_recommended_model(selector);
+
+        assert_eq!(
+            selector.as_ref().map(|value| value.current_value.as_str()),
+            Some(DEFAULT_RECOMMENDED_MODEL)
+        );
+    }
+
+    #[test]
+    fn recommended_model_is_ignored_when_unavailable() {
+        let selector = Some(AcpModelSelector {
+            config_id: "model".to_string(),
+            current_value: "openai/gpt-5.4".to_string(),
+            options: vec![AcpModelOption {
+                value: "openai/gpt-5.4".to_string(),
+                name: "GPT-5.4".to_string(),
+                description: None,
+            }],
+        });
+
+        let selector = apply_default_recommended_model(selector);
+
+        assert_eq!(
+            selector.as_ref().map(|value| value.current_value.as_str()),
+            Some("openai/gpt-5.4")
         );
     }
 
