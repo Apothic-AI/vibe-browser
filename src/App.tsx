@@ -1,5 +1,6 @@
 import { For, Show, createEffect, createMemo, createSignal, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import logoImage from "./assets/logo.png";
 import "./App.css";
 
 interface CommandResponse<T> {
@@ -491,7 +492,7 @@ function App() {
     <div class="app-shell">
       <header class="browser-topbar">
         <div class="brand-block">
-          <div class="brand-mark">V</div>
+          <img class="brand-mark" src={logoImage} alt="" />
           <div>
             <div class="brand-name">Vibe Browser</div>
             <div class="brand-subtitle">

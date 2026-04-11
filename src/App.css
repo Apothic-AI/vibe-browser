@@ -115,19 +115,11 @@ button {
 }
 
 .brand-mark {
-  width: 2.75rem;
-  height: 2.75rem;
-  border-radius: 14px;
-  display: grid;
-  place-items: center;
-  font-size: 1.05rem;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  color: #06101d;
-  background: linear-gradient(145deg, rgba(88, 243, 213, 0.95), rgba(111, 145, 255, 0.95));
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.08),
-    0 10px 30px rgba(88, 243, 213, 0.28);
+  width: 2.9rem;
+  height: 2.9rem;
+  display: block;
+  object-fit: contain;
+  filter: drop-shadow(0 10px 30px rgba(88, 243, 213, 0.2));
 }
 
 .brand-name {
