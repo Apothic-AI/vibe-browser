@@ -568,6 +568,7 @@ async fn visit_vibe_url_inner(
     let prompt = build_vibe_prompt(&discovered, &render_session, agent_settings);
     let mut agent_run =
         run_acp_render_agent(agent_settings, &render_session, &prompt, selected_model).await?;
+    let tool_call_transcript = looks_like_tool_call_transcript(&agent_run.assistant_text);
 
     let mut fallback_used = false;
     if !render_session.index_path.exists() {
@@ -586,6 +587,13 @@ async fn visit_vibe_url_inner(
             });
             fallback_used = true;
         }
+    }
+
+    if !render_session.index_path.exists() && tool_call_transcript {
+        bail!(
+            "agent described file writes in plain text instead of invoking ACP fs/write_text_file. \
+Use a model or adapter that supports ACP tool use, or keep the stricter Vibe Browser render prompt in place so the agent performs the writes instead of narrating them."
+        );
     }
 
     let html = tokio::fs::read_to_string(&render_session.index_path)
@@ -981,7 +989,11 @@ Your job is to create a concrete page that this browser can render.
    `{vibe_path}`
 8. If the site already publishes a VIBE.md, you MAY still write an updated working copy into `{vibe_path}`, but do not overwrite the meaning of the published one unless you are clearly extending it for rendering purposes.
 9. If the VIBE document or the live site references integrations or endpoints that you do not support, ignore them gracefully and keep rendering the best page you can from the available instructions.
-10. When you are done, send a short final assistant message that starts with `RENDER_READY:` and names the main file path.
+10. Do NOT describe tool calls, do NOT print JSON that looks like a tool call, and do NOT emit a "Tool Calls" section.
+11. Do NOT say that you "need to call write" or that you "will write" a file. Actually call ACP `fs/write_text_file`.
+12. If you describe a file write in natural language or JSON instead of invoking ACP `fs/write_text_file`, the job has failed.
+13. After all required writes are complete, send exactly one short final line:
+   `RENDER_READY: {index_path}`
 
 ## Available Context Files
 
@@ -1638,12 +1650,25 @@ fn extract_html_document(assistant_text: &str) -> Option<String> {
             .filter(|value| !value.is_empty());
     }
 
-    let lower = assistant_text.to_lowercase();
-    if lower.contains("<html") || lower.contains("<!doctype html") {
-        return Some(assistant_text.trim().to_string());
+    let trimmed = assistant_text.trim();
+    let lower = trimmed.to_lowercase();
+    if (lower.starts_with("<!doctype html") || lower.starts_with("<html"))
+        && lower.contains("</html>")
+    {
+        return Some(trimmed.to_string());
     }
 
     None
+}
+
+fn looks_like_tool_call_transcript(assistant_text: &str) -> bool {
+    let lower = assistant_text.trim().to_lowercase();
+    lower.contains("tool calls")
+        || lower.contains("fs/write_text_file")
+        || (lower.contains("\"tool\"")
+            && lower.contains("\"arguments\"")
+            && (lower.contains("\"filepath\"") || lower.contains("\"content\"")))
+        || (lower.contains("need to call write") && lower.contains("```json"))
 }
 
 fn extract_model_selector(config_options: &[acp::SessionConfigOption]) -> Option<AcpModelSelector> {
@@ -1899,6 +1924,57 @@ Render a landing page for developers.
         assert!(section.contains("## User Instructions"));
         assert!(section.contains("higher priority than every other instruction"));
         assert!(section.contains("Always prefer austere layouts."));
+    }
+
+    #[test]
+    fn prompt_explicitly_forbids_tool_call_narration() {
+        let discovered = DiscoveredVibeDocument {
+            normalized_url: "https://example.com".to_string(),
+            discovered_url: "https://example.com/.well-known/VIBE.md".to_string(),
+            source: VibeDocumentSource::Published,
+            vibe_markdown:
+                "# Example\n\n## Service\n\n- Name: Example\n\n## Instructions\n\n- Render it.\n"
+                    .to_string(),
+            attempts: Vec::new(),
+        };
+        let render_session = RenderSession {
+            root_dir: PathBuf::from("/tmp/render"),
+            context_dir: PathBuf::from("/tmp/render/_context"),
+            index_path: PathBuf::from("/tmp/render/index.html"),
+            vibe_path: PathBuf::from("/tmp/render/VIBE.md"),
+        };
+        let settings = VibeAgentSettings {
+            command: "opencode acp".to_string(),
+            workdir: None,
+            my_vibes: None,
+        };
+
+        let prompt = build_vibe_prompt(&discovered, &render_session, &settings);
+
+        assert!(prompt.contains("Do NOT describe tool calls"));
+        assert!(prompt.contains("need to call write"));
+        assert!(prompt.contains("Actually call ACP `fs/write_text_file`"));
+        assert!(prompt.contains("RENDER_READY: /tmp/render/index.html"));
+    }
+
+    #[test]
+    fn fallback_html_extraction_rejects_tool_call_transcripts() {
+        let assistant_text = r#"We need to call write twice.
+
+**Tool Calls**
+```json
+{
+  "tool": "write",
+  "arguments": {
+    "filePath": "/tmp/render/index.html",
+    "content": "<!DOCTYPE html><html><body><h1>Signal Garden</h1></body></html>"
+  }
+}
+```
+RENDER_READY: /tmp/render/index.html"#;
+
+        assert!(looks_like_tool_call_transcript(assistant_text));
+        assert_eq!(extract_html_document(assistant_text), None);
     }
 
     #[tokio::test]

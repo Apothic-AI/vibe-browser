@@ -579,7 +579,7 @@ function App() {
             when={modelSelector()}
             fallback={
               <label class="settings-field">
-                <span>Model</span>
+                <span>Model (We recommend OpenRouter/Mercury 2)</span>
                 <button
                   type="button"
                   class="secondary-action secondary-action--muted settings-inline-button"
@@ -598,7 +598,7 @@ function App() {
           >
             {(selector) => (
               <label class="settings-field">
-                <span>Model</span>
+                <span>Model (We recommend OpenRouter/Mercury 2)</span>
                 <select
                   ref={(element) => {
                     modelSelectRef = element;
