@@ -20,6 +20,7 @@ const VIBE_AGENT_MY_VIBES_KEY: &str = "vibe_agent_my_vibes";
 const VIBE_AGENT_LLMS_TXT_TIMEOUT_MS_KEY: &str = "vibe_agent_llms_txt_timeout_ms";
 const DEFAULT_RECOMMENDED_MODEL: &str = "openrouter/inception/mercury-2";
 const DEFAULT_LLMS_TXT_TIMEOUT_MS: u64 = 250;
+const SOURCE_PAGE_FETCH_TIMEOUT_MS: u64 = 2_000;
 // Keep a local copy of the protocol spec so the standalone repo builds outside the monorepo.
 const VIBE_SPEC_MARKDOWN: &str = include_str!("../../VIBE-PROTOCOL-SPEC.md");
 
@@ -69,6 +70,11 @@ pub struct VibeNavigationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VibeAgentModelPreference {
     pub selected_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VibeAgentMyVibesUpdate {
+    pub my_vibes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,11 +141,18 @@ struct DiscoveredVibeDocument {
     source: VibeDocumentSource,
     vibe_markdown: String,
     llms_txt: Option<LlmsTextDocument>,
+    source_page: Option<SourcePageDocument>,
     attempts: Vec<DiscoveryAttempt>,
 }
 
 #[derive(Debug, Clone)]
 struct LlmsTextDocument {
+    url: String,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct SourcePageDocument {
     url: String,
     content: String,
 }
@@ -166,6 +179,18 @@ struct AgentRunResult {
     assistant_text: String,
     stop_reason: String,
     model_selector: Option<AcpModelSelector>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRunDiagnosticsSummary {
+    status: String,
+    stop_reason: Option<String>,
+    error: Option<String>,
+    assistant_text_chars: usize,
+    stderr_chars: usize,
+    log_count: usize,
+    traffic_count: usize,
+    generated_files: Vec<GeneratedFile>,
 }
 
 #[derive(Clone)]
@@ -475,6 +500,20 @@ pub async fn set_vibe_agent_model_preference(
 }
 
 #[tauri::command]
+pub async fn set_vibe_agent_my_vibes(
+    update: VibeAgentMyVibesUpdate,
+    state: State<'_, VibeState>,
+) -> Result<CommandResponse<VibeAgentMyVibesUpdate>, String> {
+    let my_vibes = persist_agent_my_vibes(&state.config_manager, update.my_vibes.as_deref())
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok(CommandResponse::success(VibeAgentMyVibesUpdate {
+        my_vibes,
+    }))
+}
+
+#[tauri::command]
 pub async fn set_vibe_agent_settings(
     settings: VibeAgentSettings,
     state: State<'_, VibeState>,
@@ -518,26 +557,9 @@ pub async fn set_vibe_agent_settings(
         }
     }
 
-    match settings
-        .my_vibes
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(my_vibes) => {
-            state
-                .config_manager
-                .set_config_value(VIBE_AGENT_MY_VIBES_KEY, my_vibes)
-                .await
-                .map_err(|err| err.to_string())?;
-        }
-        None => {
-            let _ = state
-                .config_manager
-                .delete_config_value(VIBE_AGENT_MY_VIBES_KEY)
-                .await;
-        }
-    }
+    persist_agent_my_vibes(&state.config_manager, settings.my_vibes.as_deref())
+        .await
+        .map_err(|err| err.to_string())?;
 
     let llms_txt_timeout_ms = settings.llms_txt_timeout_ms.to_string();
     state
@@ -775,6 +797,31 @@ async fn persist_agent_model_preference(
     Ok(())
 }
 
+async fn persist_agent_my_vibes(
+    config_manager: &ConfigManager,
+    my_vibes: Option<&str>,
+) -> Result<Option<String>> {
+    let normalized = my_vibes
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    match normalized.as_deref() {
+        Some(my_vibes) => {
+            config_manager
+                .set_config_value(VIBE_AGENT_MY_VIBES_KEY, my_vibes)
+                .await?;
+        }
+        None => {
+            let _ = config_manager
+                .delete_config_value(VIBE_AGENT_MY_VIBES_KEY)
+                .await;
+        }
+    }
+
+    Ok(normalized)
+}
+
 fn default_agent_command() -> String {
     "opencode acp".to_string()
 }
@@ -817,6 +864,7 @@ async fn discover_vibe_document(
                         source: VibeDocumentSource::Published,
                         vibe_markdown: body,
                         llms_txt: None,
+                        source_page: None,
                         attempts,
                     });
                 }
@@ -841,11 +889,19 @@ async fn discover_vibe_document(
 
     let llms_txt =
         fetch_optional_llms_txt(&client, &normalized, llms_txt_timeout, &mut attempts).await?;
+    let source_page = fetch_optional_source_page(
+        &client,
+        &normalized,
+        Duration::from_millis(SOURCE_PAGE_FETCH_TIMEOUT_MS),
+        &mut attempts,
+    )
+    .await?;
 
     Ok(build_agent_inference_document(
         &normalized,
         attempts,
         llms_txt,
+        source_page,
     )?)
 }
 
@@ -996,10 +1052,69 @@ async fn fetch_optional_llms_txt(
     }
 }
 
+async fn fetch_optional_source_page(
+    client: &reqwest::Client,
+    normalized: &Url,
+    timeout: Duration,
+    attempts: &mut Vec<DiscoveryAttempt>,
+) -> Result<Option<SourcePageDocument>> {
+    let candidate = build_inference_target(normalized)?;
+    let response = client.get(candidate.as_str()).timeout(timeout).send().await;
+
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .context("failed to read source page HTML")?;
+                attempts.push(DiscoveryAttempt {
+                    url: candidate.to_string(),
+                    ok: true,
+                    status_code: Some(status.as_u16()),
+                    detail: "Fetched source page HTML".to_string(),
+                });
+
+                Ok(Some(SourcePageDocument {
+                    url: candidate.to_string(),
+                    content: body,
+                }))
+            } else {
+                attempts.push(DiscoveryAttempt {
+                    url: candidate.to_string(),
+                    ok: false,
+                    status_code: Some(status.as_u16()),
+                    detail: format!("Source page HTTP {}", status.as_u16()),
+                });
+                Ok(None)
+            }
+        }
+        Err(err) => {
+            let detail = if err.is_timeout() {
+                format!(
+                    "Timed out after {} ms while fetching source page",
+                    timeout.as_millis()
+                )
+            } else {
+                err.to_string()
+            };
+            attempts.push(DiscoveryAttempt {
+                url: candidate.to_string(),
+                ok: false,
+                status_code: None,
+                detail,
+            });
+            Ok(None)
+        }
+    }
+}
+
 fn build_agent_inference_document(
     normalized: &Url,
     mut attempts: Vec<DiscoveryAttempt>,
     llms_txt: Option<LlmsTextDocument>,
+    source_page: Option<SourcePageDocument>,
 ) -> Result<DiscoveredVibeDocument> {
     let inference_url = build_inference_target(normalized)?;
     attempts.push(DiscoveryAttempt {
@@ -1016,6 +1131,7 @@ fn build_agent_inference_document(
         source: VibeDocumentSource::Inferred,
         vibe_markdown: build_inference_request_markdown(&inference_url, &attempts),
         llms_txt,
+        source_page,
         attempts,
     })
 }
@@ -1055,6 +1171,13 @@ async fn prepare_render_session(
     }
     if let Some(llms_txt) = &discovered.llms_txt {
         tokio::fs::write(context_dir.join("llms.txt"), llms_txt.content.as_bytes()).await?;
+    }
+    if let Some(source_page) = &discovered.source_page {
+        tokio::fs::write(
+            context_dir.join("SOURCE-PAGE.html"),
+            source_page.content.as_bytes(),
+        )
+        .await?;
     }
     tokio::fs::write(
         context_dir.join("VIBE-PROTOCOL-SPEC.md"),
@@ -1119,6 +1242,17 @@ Your job is to create a concrete page that this browser can render.
 12. If you describe a file write in natural language or JSON instead of invoking ACP `fs/write_text_file`, the job has failed.
 13. After all required writes are complete, send exactly one short final line:
    `RENDER_READY: {index_path}`
+14. Prefer ACP `fs/read_text_file` for the provided context files and ACP `fs/write_text_file` for the final outputs.
+15. Do NOT use internal edit loops like `apply_patch` to iteratively patch files. Compose the final file contents and write them directly.
+
+## Rendering Priorities
+
+- Do not develop the entire site. Only develop the single page requested by the current URL.
+- Try to retain the functionality of the original site as much as possible.
+- Don't mention anything about the design choices in the human-readable text of the page(s).
+- If a local source page copy was provided, read that first. Only fetch or inspect the live website yourself if the provided source page is missing or clearly insufficient.
+- You should redisplay things like thumbnail images, videos, etc. using their original href/src/etc URLs.
+- Avoid browser automation and external browsing tools when the provided local source page copy is sufficient.
 
 ## Available Context Files
 
@@ -1180,13 +1314,68 @@ async fn run_acp_render_agent(
             .context("failed to create ACP runtime")?;
 
         runtime.block_on(async move {
-            let mut command = build_agent_process(&agent_settings, &render_session)?;
-            let mut child = command.spawn().with_context(|| {
+            let client_impl = VibeAcpClient::new(render_session.root_dir.clone());
+            let client_snapshot = client_impl.clone();
+            let traffic_snapshot = client_snapshot.clone();
+            let session_cwd = render_session.root_dir.display().to_string();
+            let snapshot_diagnostics = || {
+                let logs = client_snapshot.snapshot_logs();
+                let traffic = client_snapshot.snapshot_traffic();
+                let assistant_text = client_snapshot.snapshot_assistant_text();
+                let generated_files = snapshot_generated_files(&client_snapshot, &render_session);
+
+                (logs, traffic, assistant_text, generated_files)
+            };
+
+            let mut command = match build_agent_process(&agent_settings, &render_session) {
+                Ok(command) => command,
+                Err(err) => {
+                    let error_message = err.to_string();
+                    client_snapshot.push_log(
+                        "error",
+                        format!("Failed to build ACP agent process: {error_message}"),
+                    );
+                    let (logs, traffic, assistant_text, generated_files) = snapshot_diagnostics();
+                    persist_agent_run_diagnostics(
+                        &render_session,
+                        &logs,
+                        &traffic,
+                        &assistant_text,
+                        "",
+                        &generated_files,
+                        None,
+                        Some(&error_message),
+                    );
+                    return Err(err);
+                }
+            };
+            let mut child = match command.spawn().with_context(|| {
                 format!(
                     "failed to start ACP agent command: {}",
                     agent_settings.command
                 )
-            })?;
+            }) {
+                Ok(child) => child,
+                Err(err) => {
+                    let error_message = err.to_string();
+                    client_snapshot.push_log(
+                        "error",
+                        format!("Failed to spawn ACP agent process: {error_message}"),
+                    );
+                    let (logs, traffic, assistant_text, generated_files) = snapshot_diagnostics();
+                    persist_agent_run_diagnostics(
+                        &render_session,
+                        &logs,
+                        &traffic,
+                        &assistant_text,
+                        "",
+                        &generated_files,
+                        None,
+                        Some(&error_message),
+                    );
+                    return Err(err);
+                }
+            };
 
             let outgoing = child
                 .stdin
@@ -1205,11 +1394,6 @@ async fn run_acp_render_agent(
                     String::from_utf8_lossy(&bytes).to_string()
                 })
             });
-
-            let client_impl = VibeAcpClient::new(render_session.root_dir.clone());
-            let client_snapshot = client_impl.clone();
-            let traffic_snapshot = client_snapshot.clone();
-            let session_cwd = render_session.root_dir.display().to_string();
 
             let local_set = tokio::task::LocalSet::new();
             let prompt_result = local_set
@@ -1344,6 +1528,7 @@ async fn run_acp_render_agent(
             let (stop_reason, model_selector) = match prompt_result {
                 Ok(payload) => payload,
                 Err(err) => {
+                    client_snapshot.push_log("error", format!("ACP render failed: {err}"));
                     let stderr_tail = stderr_output
                         .lines()
                         .rev()
@@ -1353,43 +1538,43 @@ async fn run_acp_render_agent(
                         .rev()
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let error_message = if stderr_tail.trim().is_empty() {
+                        err.to_string()
+                    } else {
+                        format!("{err}\n\nAgent stderr:\n{stderr_tail}")
+                    };
+                    let (logs, traffic, assistant_text, generated_files) = snapshot_diagnostics();
+                    persist_agent_run_diagnostics(
+                        &render_session,
+                        &logs,
+                        &traffic,
+                        &assistant_text,
+                        &stderr_output,
+                        &generated_files,
+                        None,
+                        Some(&error_message),
+                    );
 
-                    if stderr_tail.trim().is_empty() {
-                        return Err(err);
-                    }
-
-                    return Err(anyhow!("{err}\n\nAgent stderr:\n{stderr_tail}"));
+                    return Err(anyhow!(error_message));
                 }
             };
-
-            let mut generated_files = client_snapshot
-                .snapshot_writes()
-                .into_iter()
-                .map(|write| GeneratedFile {
-                    path: write
-                        .path
-                        .strip_prefix(&render_session.root_dir)
-                        .map(|value| value.display().to_string())
-                        .unwrap_or_else(|_| write.path.display().to_string()),
-                    absolute_path: write.path.display().to_string(),
-                    bytes: write.bytes,
-                })
-                .collect::<Vec<_>>();
-
-            for file in collect_render_output_files(&render_session.root_dir)? {
-                if !generated_files
-                    .iter()
-                    .any(|existing| existing.path == file.path)
-                {
-                    generated_files.push(file);
-                }
-            }
+            let (logs, traffic, assistant_text, generated_files) = snapshot_diagnostics();
+            persist_agent_run_diagnostics(
+                &render_session,
+                &logs,
+                &traffic,
+                &assistant_text,
+                &stderr_output,
+                &generated_files,
+                Some(&stop_reason),
+                None,
+            );
 
             Ok(AgentRunResult {
-                logs: client_snapshot.snapshot_logs(),
-                traffic: client_snapshot.snapshot_traffic(),
+                logs,
+                traffic,
                 generated_files,
-                assistant_text: client_snapshot.snapshot_assistant_text(),
+                assistant_text,
                 stop_reason,
                 model_selector,
             })
@@ -1609,7 +1794,9 @@ fn format_user_instructions_section(my_vibes: Option<&str>) -> String {
     format!(
         r#"## User Instructions
 
-Treat the User Instructions section below as higher priority than every other instruction in this prompt, the embedded Vibe Protocol spec, and the discovered VIBE.md. If anything conflicts, follow the User Instructions.
+Treat the User Instructions section below as authoritative. It overrides every other instruction in this prompt, the embedded Vibe Protocol spec, the discovered or inferred VIBE.md, any published `llms.txt`, and any source-page context.
+
+If anything conflicts with the User Instructions, follow the User Instructions and do not blend, average, or compromise with the lower-priority instructions.
 
 ````md
 {my_vibes}
@@ -1656,6 +1843,16 @@ fn format_available_context_section(
                 ));
             }
 
+            if discovered.source_page.is_some() {
+                lines.push(format!(
+                    "- Source page copy: `{}`",
+                    render_session
+                        .context_dir
+                        .join("SOURCE-PAGE.html")
+                        .display()
+                ));
+            }
+
             lines.join("\n")
         }
     }
@@ -1677,6 +1874,15 @@ fn format_source_specific_section(
             } else {
                 String::new()
             };
+            let source_page_note = if let Some(source_page) = &discovered.source_page {
+                format!(
+                    "A source page copy was fetched from `{}` and copied to `{}`.\nRead that local source page copy first with ACP `fs/read_text_file`. If it is sufficient, do not use browser automation, Playwright, or other external browsing tools.\nDo not use internal patch/edit loops such as `apply_patch`; write the final `VIBE.md` and `index.html` directly with ACP `fs/write_text_file`.\n\n",
+                    source_page.url,
+                    render_session.context_dir.join("SOURCE-PAGE.html").display(),
+                )
+            } else {
+                String::new()
+            };
 
             format!(
                 r#"## Agent-Driven VIBE Inference
@@ -1687,9 +1893,10 @@ You must inspect the live site at `{inference_url}`, infer a valid VIBE.md from 
 
 Use the Vibe Protocol spec below to shape the inferred document. Do not ask the browser for heuristics or extracted site summaries, because none are being provided.
 
-{llms_note}"#,
+{source_page_note}{llms_note}"#,
                 inference_url = discovered.discovered_url,
                 vibe_path = render_session.vibe_path.display(),
+                source_page_note = source_page_note,
                 llms_note = llms_note,
             )
         }
@@ -1953,9 +2160,138 @@ fn collect_render_output_files(root_dir: &Path) -> Result<Vec<GeneratedFile>> {
     Ok(files)
 }
 
+fn snapshot_generated_files(
+    client_snapshot: &VibeAcpClient,
+    render_session: &RenderSession,
+) -> Vec<GeneratedFile> {
+    let mut generated_files = client_snapshot
+        .snapshot_writes()
+        .into_iter()
+        .map(|write| GeneratedFile {
+            path: write
+                .path
+                .strip_prefix(&render_session.root_dir)
+                .map(|value| value.display().to_string())
+                .unwrap_or_else(|_| write.path.display().to_string()),
+            absolute_path: write.path.display().to_string(),
+            bytes: write.bytes,
+        })
+        .collect::<Vec<_>>();
+
+    match collect_render_output_files(&render_session.root_dir) {
+        Ok(files) => {
+            for file in files {
+                if !generated_files
+                    .iter()
+                    .any(|existing| existing.path == file.path)
+                {
+                    generated_files.push(file);
+                }
+            }
+        }
+        Err(err) => {
+            log::warn!(
+                "failed to collect render output files for {}: {}",
+                render_session.root_dir.display(),
+                err
+            );
+        }
+    }
+
+    generated_files
+}
+
+fn persist_agent_run_diagnostics(
+    render_session: &RenderSession,
+    logs: &[AgentLogEntry],
+    traffic: &[AcpTrafficEntry],
+    assistant_text: &str,
+    stderr_output: &str,
+    generated_files: &[GeneratedFile],
+    stop_reason: Option<&str>,
+    error: Option<&str>,
+) {
+    if let Err(err) = persist_agent_run_diagnostics_inner(
+        render_session,
+        logs,
+        traffic,
+        assistant_text,
+        stderr_output,
+        generated_files,
+        stop_reason,
+        error,
+    ) {
+        log::warn!(
+            "failed to persist ACP diagnostics for {}: {}",
+            render_session.root_dir.display(),
+            err
+        );
+    }
+}
+
+fn persist_agent_run_diagnostics_inner(
+    render_session: &RenderSession,
+    logs: &[AgentLogEntry],
+    traffic: &[AcpTrafficEntry],
+    assistant_text: &str,
+    stderr_output: &str,
+    generated_files: &[GeneratedFile],
+    stop_reason: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    std::fs::create_dir_all(&render_session.context_dir)?;
+
+    std::fs::write(
+        render_session.context_dir.join("agent-logs.json"),
+        serde_json::to_vec_pretty(logs)?,
+    )?;
+    std::fs::write(
+        render_session.context_dir.join("acp-traffic.json"),
+        serde_json::to_vec_pretty(traffic)?,
+    )?;
+    std::fs::write(
+        render_session.context_dir.join("assistant-final.txt"),
+        assistant_text.as_bytes(),
+    )?;
+    std::fs::write(
+        render_session.context_dir.join("agent-stderr.txt"),
+        stderr_output.as_bytes(),
+    )?;
+
+    if let Some(error) = error {
+        std::fs::write(
+            render_session.context_dir.join("agent-error.txt"),
+            error.as_bytes(),
+        )?;
+    }
+
+    let summary = AgentRunDiagnosticsSummary {
+        status: if error.is_some() {
+            "error".to_string()
+        } else {
+            "ok".to_string()
+        },
+        stop_reason: stop_reason.map(str::to_string),
+        error: error.map(str::to_string),
+        assistant_text_chars: assistant_text.chars().count(),
+        stderr_chars: stderr_output.chars().count(),
+        log_count: logs.len(),
+        traffic_count: traffic.len(),
+        generated_files: generated_files.to_vec(),
+    };
+
+    std::fs::write(
+        render_session.context_dir.join("agent-run.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{initialize_database, ConfigManager};
     use anyhow::Result;
     use std::fs;
     use tempfile::TempDir;
@@ -2075,18 +2411,18 @@ Render a landing page for developers.
             .any(|attempt| attempt.detail.contains("ACP agent must infer one")));
         assert!(result.html.contains("Rendered from VIBE.md"));
         assert!(Path::new(&result.render_dir).join("VIBE.md").exists());
-        assert!(!Path::new(&result.render_dir)
+        assert!(Path::new(&result.render_dir)
             .join("_context")
             .join("SOURCE-PAGE.html")
             .exists());
+        assert!(result
+            .discovery_attempts
+            .iter()
+            .any(|attempt| attempt.detail.contains("Fetched source page HTML")));
         assert!(!Path::new(&result.render_dir)
             .join("_context")
             .join("llms.txt")
             .exists());
-        assert!(!result
-            .discovery_attempts
-            .iter()
-            .any(|attempt| attempt.detail.contains("Fetched source page")));
 
         Ok(())
     }
@@ -2137,15 +2473,22 @@ Render a landing page for developers.
 
         let context_dir = Path::new(&result.render_dir).join("_context");
         let llms_path = context_dir.join("llms.txt");
+        let source_page_path = context_dir.join("SOURCE-PAGE.html");
         let prompt_path = context_dir.join("PROMPT.md");
         let llms_text = fs::read_to_string(&llms_path)?;
+        let source_page_text = fs::read_to_string(&source_page_path)?;
         let prompt_text = fs::read_to_string(&prompt_path)?;
 
         assert_eq!(result.vibe_source, VibeDocumentSource::Inferred);
         assert!(llms_path.exists());
+        assert!(source_page_path.exists());
         assert!(llms_text.contains("Publisher-authored text index"));
+        assert!(source_page_text.contains("<title>Docs Garden</title>"));
         assert!(prompt_text.contains("## Published llms.txt"));
         assert!(prompt_text.contains("Use the published `llms.txt` companion"));
+        assert!(prompt_text.contains("SOURCE-PAGE.html"));
+        assert!(prompt_text.contains("Do NOT use internal edit loops like `apply_patch`"));
+        assert!(prompt_text.contains("Avoid browser automation and external browsing tools"));
         assert!(prompt_text.contains("Publisher-authored text index"));
         assert!(result
             .discovery_attempts
@@ -2197,6 +2540,7 @@ Render a landing page for developers.
         let context_dir = Path::new(&result.render_dir).join("_context");
 
         assert_eq!(result.vibe_source, VibeDocumentSource::Inferred);
+        assert!(context_dir.join("SOURCE-PAGE.html").exists());
         assert!(!context_dir.join("llms.txt").exists());
         assert!(result.discovery_attempts.iter().any(|attempt| {
             attempt.url.ends_with("/llms.txt")
@@ -2204,6 +2548,63 @@ Render a landing page for developers.
                     .detail
                     .contains("Timed out after 100 ms while fetching llms.txt")
         }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_agent_runs_persist_diagnostics_to_context() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let script_path = write_failing_stub_agent_script(temp_dir.path())?;
+        let python = find_python_command()?;
+        let server = start_test_site(
+            Some(
+                r#"# VIBE.md
+
+## Service
+
+Name: Failing Garden
+
+## Instructions
+
+Render a landing page.
+"#,
+            ),
+            "<!doctype html><html><body><h1>Failing Garden</h1></body></html>",
+            None,
+            None,
+        )
+        .await?;
+
+        let settings = VibeAgentSettings {
+            command: format!("{} {}", python, script_path.display()),
+            workdir: None,
+            my_vibes: None,
+            llms_txt_timeout_ms: DEFAULT_LLMS_TXT_TIMEOUT_MS,
+        };
+
+        let err = visit_vibe_url_inner(&server.base_url, None, &settings, temp_dir.path())
+            .await
+            .expect_err("expected stub ACP agent to fail");
+        assert!(err.to_string().contains("simulated render failure"));
+
+        let render_root = temp_dir.path().join("vibe-renders");
+        let render_dirs = fs::read_dir(&render_root)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(render_dirs.len(), 1);
+
+        let context_dir = render_dirs[0].join("_context");
+        let stderr_text = fs::read_to_string(context_dir.join("agent-stderr.txt"))?;
+        let traffic_text = fs::read_to_string(context_dir.join("acp-traffic.json"))?;
+        let run_text = fs::read_to_string(context_dir.join("agent-run.json"))?;
+
+        assert!(context_dir.join("agent-logs.json").exists());
+        assert!(context_dir.join("assistant-final.txt").exists());
+        assert!(context_dir.join("agent-error.txt").exists());
+        assert!(stderr_text.contains("simulated render failure"));
+        assert!(traffic_text.contains("session/prompt.request"));
+        assert!(run_text.contains("\"status\": \"error\""));
 
         Ok(())
     }
@@ -2287,7 +2688,11 @@ Render a landing page for developers.
         let section = format_user_instructions_section(Some("Always prefer austere layouts."));
 
         assert!(section.contains("## User Instructions"));
-        assert!(section.contains("higher priority than every other instruction"));
+        assert!(section.contains("Treat the User Instructions section below as authoritative."));
+        assert!(section.contains("It overrides every other instruction in this prompt"));
+        assert!(section.contains("published `llms.txt`"));
+        assert!(section.contains("source-page context"));
+        assert!(section.contains("do not blend, average, or compromise"));
         assert!(section.contains("Always prefer austere layouts."));
     }
 
@@ -2301,6 +2706,7 @@ Render a landing page for developers.
                 "# Example\n\n## Service\n\n- Name: Example\n\n## Instructions\n\n- Render it.\n"
                     .to_string(),
             llms_txt: None,
+            source_page: None,
             attempts: Vec::new(),
         };
         let render_session = RenderSession {
@@ -2312,7 +2718,7 @@ Render a landing page for developers.
         let settings = VibeAgentSettings {
             command: "opencode acp".to_string(),
             workdir: None,
-            my_vibes: None,
+            my_vibes: Some("Always prefer austere layouts.".to_string()),
             llms_txt_timeout_ms: DEFAULT_LLMS_TXT_TIMEOUT_MS,
         };
 
@@ -2322,6 +2728,58 @@ Render a landing page for developers.
         assert!(prompt.contains("need to call write"));
         assert!(prompt.contains("Actually call ACP `fs/write_text_file`"));
         assert!(prompt.contains("RENDER_READY: /tmp/render/index.html"));
+        assert!(prompt.contains("Prefer ACP `fs/read_text_file` for the provided context files"));
+        assert!(prompt.contains("Do NOT use internal edit loops like `apply_patch`"));
+        assert!(prompt.contains(
+            "Do not develop the entire site. Only develop the single page requested by the current URL."
+        ));
+        assert!(prompt
+            .contains("Try to retain the functionality of the original site as much as possible."));
+        assert!(prompt.contains("If a local source page copy was provided, read that first."));
+        assert!(prompt.contains(
+            "You should redisplay things like thumbnail images, videos, etc. using their original href/src/etc URLs."
+        ));
+        assert!(prompt.contains(
+            "Avoid browser automation and external browsing tools when the provided local source page copy is sufficient."
+        ));
+        assert!(prompt.contains(
+            "Don't mention anything about the design choices in the human-readable text of the page(s)."
+        ));
+        assert!(prompt.contains(
+            "Treat the User Instructions section below as authoritative."
+        ));
+        assert!(prompt.contains(
+            "If anything conflicts with the User Instructions, follow the User Instructions and do not blend, average, or compromise with the lower-priority instructions."
+        ));
+        assert!(prompt.contains("Always prefer austere layouts."));
+    }
+
+    #[tokio::test]
+    async fn my_vibes_persistence_round_trips_through_config() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let db_pool = initialize_database(&temp_dir.path().to_path_buf()).await?;
+        let config_manager = ConfigManager::new(db_pool);
+
+        let saved = persist_agent_my_vibes(
+            &config_manager,
+            Some("  Keep the copy sharp and technical.  "),
+        )
+        .await?;
+        assert_eq!(saved.as_deref(), Some("Keep the copy sharp and technical."));
+
+        let settings = resolve_agent_settings(&config_manager).await?;
+        assert_eq!(
+            settings.my_vibes.as_deref(),
+            Some("Keep the copy sharp and technical.")
+        );
+
+        let cleared = persist_agent_my_vibes(&config_manager, Some("   ")).await?;
+        assert_eq!(cleared, None);
+
+        let settings = resolve_agent_settings(&config_manager).await?;
+        assert_eq!(settings.my_vibes, None);
+
+        Ok(())
     }
 
     #[test]
@@ -2596,6 +3054,75 @@ while True:
             }
         })
         continue
+
+    if request_id is not None:
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32601,
+                "message": f"Method not found: {method}"
+            }
+        })
+"##;
+
+        fs::write(&script_path, script)?;
+        Ok(script_path)
+    }
+
+    fn write_failing_stub_agent_script(base_dir: &Path) -> Result<PathBuf> {
+        let script_path = base_dir.join("failing_stub_acp_agent.py");
+        let script = r##"#!/usr/bin/env python3
+import json
+import sys
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+    return json.loads(line)
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+while True:
+    message = recv()
+    method = message.get("method")
+    request_id = message.get("id")
+    params = message.get("params") or {}
+
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": params.get("protocolVersion", 1),
+                "agentCapabilities": {},
+                "authMethods": [],
+                "agentInfo": {
+                    "name": "failing-stub-acp-agent",
+                    "version": "0.1.0",
+                    "title": "Failing Stub ACP Agent"
+                }
+            }
+        })
+        continue
+
+    if method == "session/new":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "sessionId": "failing-stub-session"
+            }
+        })
+        continue
+
+    if method == "session/prompt":
+        sys.stderr.write("simulated render failure\n")
+        sys.stderr.flush()
+        sys.exit(1)
 
     if request_id is not None:
         send({

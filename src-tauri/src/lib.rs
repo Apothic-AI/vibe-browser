@@ -43,6 +43,7 @@ pub fn run() {
             get_vibe_agent_settings,
             get_vibe_agent_model_selector,
             set_vibe_agent_model_preference,
+            set_vibe_agent_my_vibes,
             set_vibe_agent_settings,
             visit_vibe_url,
             // Grid Commands

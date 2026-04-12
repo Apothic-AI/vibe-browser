@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import logoImage from "./assets/logo.png";
 import "./App.css";
@@ -31,6 +31,10 @@ interface AcpModelSelector {
 
 interface VibeAgentModelPreference {
   selected_model?: string | null;
+}
+
+interface VibeAgentMyVibesUpdate {
+  my_vibes?: string | null;
 }
 
 interface DiscoveryAttempt {
@@ -168,6 +172,7 @@ function reconcileModelSelector(
 function App() {
   const [isLoading, setIsLoading] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  const [addressBarValue, setAddressBarValue] = createSignal("");
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [detailsOpen, setDetailsOpen] = createSignal(false);
   const [agentSettings, setAgentSettings] = createSignal<VibeAgentSettings | null>(null);
@@ -181,6 +186,8 @@ function App() {
   const [tabs, setTabs] = createSignal<BrowserTab[]>([]);
   const [activeTabId, setActiveTabId] = createSignal("");
   let modelSelectRef: HTMLSelectElement | undefined;
+  let myVibesAutosaveTimer: number | undefined;
+  let lastPersistedMyVibes = "";
 
   const localExampleUrl = createMemo(() => {
     const origin = window.location.origin;
@@ -210,17 +217,10 @@ function App() {
     );
   };
 
-  const setActiveTabUrl = (value: string) => {
-    const tab = activeTab();
-    if (!tab) {
-      return;
-    }
-
-    updateTab(tab.id, (currentTab) => ({
-      ...currentTab,
-      url: value,
-      title: currentTab.result ? currentTab.title : displayLabelForUrl(value),
-    }));
+  const selectTab = (id: string) => {
+    const nextTab = tabs().find((tab) => tab.id === id);
+    setActiveTabId(id);
+    setAddressBarValue(nextTab?.url || "");
   };
 
   const ensureAtLeastOneTab = (initialUrl = "") => {
@@ -231,6 +231,7 @@ function App() {
 
       const nextTab = createBrowserTab(initialUrl);
       setActiveTabId(nextTab.id);
+      setAddressBarValue(nextTab.url);
       return [nextTab];
     });
   };
@@ -239,6 +240,7 @@ function App() {
     const nextTab = createBrowserTab(initialUrl);
     setTabs((currentTabs) => [...currentTabs, nextTab]);
     setActiveTabId(nextTab.id);
+    setAddressBarValue(nextTab.url);
     setError(null);
   };
 
@@ -247,6 +249,7 @@ function App() {
       if (currentTabs.length <= 1) {
         const replacement = createBrowserTab();
         setActiveTabId(replacement.id);
+        setAddressBarValue(replacement.url);
         return [replacement];
       }
 
@@ -257,6 +260,7 @@ function App() {
         const fallbackTab = nextTabs[index] || nextTabs[index - 1] || nextTabs[0];
         if (fallbackTab) {
           setActiveTabId(fallbackTab.id);
+          setAddressBarValue(fallbackTab.url);
         }
       }
 
@@ -274,7 +278,59 @@ function App() {
     setSettingsCommand(response.data.command);
     setSettingsWorkdir(response.data.workdir || "");
     setSettingsMyVibes(response.data.my_vibes || "");
+    lastPersistedMyVibes = response.data.my_vibes || "";
     setSettingsLlmsTxtTimeoutMs(String(response.data.llms_txt_timeout_ms));
+  };
+
+  const clearMyVibesAutosaveTimer = () => {
+    if (myVibesAutosaveTimer !== undefined) {
+      window.clearTimeout(myVibesAutosaveTimer);
+      myVibesAutosaveTimer = undefined;
+    }
+  };
+
+  const persistMyVibes = async (nextValue: string) => {
+    const normalized = nextValue.trim();
+    if (normalized === lastPersistedMyVibes) {
+      return;
+    }
+
+    clearMyVibesAutosaveTimer();
+
+    try {
+      const response = await invoke<CommandResponse<VibeAgentMyVibesUpdate>>(
+        "set_vibe_agent_my_vibes",
+        {
+          update: {
+            my_vibes: normalized || null,
+          },
+        },
+      );
+
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to save My Vibes.");
+      }
+
+      lastPersistedMyVibes = response.data.my_vibes || "";
+      setAgentSettings((current) =>
+        current
+          ? {
+              ...current,
+              my_vibes: response.data?.my_vibes || null,
+            }
+          : current,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save My Vibes.");
+    }
+  };
+
+  const scheduleMyVibesAutosave = (nextValue: string) => {
+    clearMyVibesAutosaveTimer();
+    myVibesAutosaveTimer = window.setTimeout(() => {
+      myVibesAutosaveTimer = undefined;
+      void persistMyVibes(nextValue);
+    }, 250);
   };
 
   const loadModelSelector = async () => {
@@ -349,6 +405,10 @@ function App() {
     }
   });
 
+  onCleanup(() => {
+    clearMyVibesAutosaveTimer();
+  });
+
   createEffect(() => {
     const value = selectedModel();
     const selector = modelSelector();
@@ -396,7 +456,7 @@ function App() {
       return;
     }
 
-    const nextUrl = (nextUrlOverride ?? tab.url).trim();
+    const nextUrl = (nextUrlOverride ?? addressBarValue()).trim();
     if (!nextUrl) {
       updateTab(tab.id, (currentTab) => ({
         ...currentTab,
@@ -410,15 +470,18 @@ function App() {
 
     setIsLoading(true);
     setError(null);
-    updateTab(tab.id, (currentTab) => ({
-      ...currentTab,
-      url: nextUrl,
-      title: displayLabelForUrl(nextUrl),
-      status: "loading",
-      error: null,
-    }));
 
     try {
+      await persistMyVibes(settingsMyVibes());
+
+      updateTab(tab.id, (currentTab) => ({
+        ...currentTab,
+        url: nextUrl,
+        title: displayLabelForUrl(nextUrl),
+        status: "loading",
+        error: null,
+      }));
+
       const response = await invoke<CommandResponse<VibeNavigationResult>>("visit_vibe_url", {
         request: {
           url: nextUrl,
@@ -438,6 +501,9 @@ function App() {
         error: null,
         result: response.data,
       }));
+      if (activeTabId() === tab.id) {
+        setAddressBarValue(response.data.normalized_url);
+      }
       applyReturnedModelSelector(response.data.model_selector, requestedModel);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Navigation failed.";
@@ -454,6 +520,7 @@ function App() {
 
   const saveSettings = async () => {
     setError(null);
+    clearMyVibesAutosaveTimer();
     const parsedLlmsTxtTimeoutMs = Number(settingsLlmsTxtTimeoutMs().trim());
 
     if (!Number.isInteger(parsedLlmsTxtTimeoutMs) || parsedLlmsTxtTimeoutMs <= 0) {
@@ -476,6 +543,7 @@ function App() {
       }
 
       setAgentSettings(response.data);
+      lastPersistedMyVibes = response.data.my_vibes || "";
       await loadModelSelector();
       setSettingsOpen(false);
     } catch (err) {
@@ -504,8 +572,8 @@ function App() {
         <form class="address-bar" onSubmit={handleSubmit}>
           <input
             type="text"
-            value={activeTab()?.url || ""}
-            onInput={(event) => setActiveTabUrl(event.currentTarget.value)}
+            value={addressBarValue()}
+            onInput={(event) => setAddressBarValue(event.currentTarget.value)}
             placeholder="Enter a site URL"
           />
           <button type="submit" class="primary-action" disabled={isLoading()}>
@@ -652,14 +720,19 @@ function App() {
             <span>My Vibes</span>
             <textarea
               value={settingsMyVibes()}
-              onInput={(event) => setSettingsMyVibes(event.currentTarget.value)}
+              onInput={(event) => {
+                const nextValue = event.currentTarget.value;
+                setSettingsMyVibes(nextValue);
+                scheduleMyVibesAutosave(nextValue);
+              }}
+              onBlur={() => void persistMyVibes(settingsMyVibes())}
               placeholder="Add personal rendering instructions for the ACP agent."
             />
             <small class="settings-help">
               Included in the ACP render prompt as a <code>User Instructions</code> section.
               That section explicitly tells the agent to treat your instructions as higher priority
               than the rest of the prompt, the embedded Vibe spec, and the discovered
-              <code> VIBE.md</code>.
+              <code> VIBE.md</code>. Changes here save automatically.
             </small>
           </label>
 
@@ -714,7 +787,7 @@ function App() {
                     classList={{
                       "browser-tab__main--active": activeTabId() === tab.id,
                     }}
-                    onClick={() => setActiveTabId(tab.id)}
+                    onClick={() => selectTab(tab.id)}
                   >
                     <div class="browser-tab__title-row">
                       <span
@@ -821,7 +894,7 @@ function App() {
                                 return;
                               }
 
-                              setActiveTabUrl(demoUrl);
+                              setAddressBarValue(demoUrl);
                               void visitActiveTab(demoUrl);
                             }}
                           >
